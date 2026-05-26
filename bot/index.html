@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>本地 Qwen 对话</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1f242d;
+    --panel-3: #262d39;
+    --border: #2a313d;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #6aa6ff;
+    --accent-soft: rgba(106, 166, 255, 0.14);
+    --user-bg: #2a4a7f;
+    --assistant-bg: #1f242d;
+    --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    height: 100vh;
+  }
+
+  /* Sidebar */
+  aside {
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .side-section { padding: 14px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .side-section.no-border { border-bottom: none; }
+  .side-section h1 {
+    font-size: 14px; margin: 0 0 2px;
+    letter-spacing: 0.5px;
+  }
+  .side-section .sub { font-size: 11px; color: var(--muted); }
+
+  /* New conv button */
+  .new-conv {
+    width: 100%; padding: 9px 10px; border: 1px dashed var(--border);
+    background: transparent; color: var(--text); border-radius: 8px; cursor: pointer;
+    font: inherit; display: flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  .new-conv:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* Conv list (scrollable) */
+  .conv-list-wrap {
+    flex: 1; min-height: 0; overflow-y: auto;
+    padding: 6px 8px;
+  }
+  .conv-list-title { font-size: 11px; color: var(--muted); padding: 6px 6px 4px; }
+  .conv-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 10px; border-radius: 7px; cursor: pointer;
+    margin-bottom: 2px; position: relative;
+  }
+  .conv-item:hover { background: var(--panel-2); }
+  .conv-item.active { background: var(--accent-soft); }
+  .conv-item.active::before {
+    content: ""; position: absolute; left: 2px; top: 6px; bottom: 6px; width: 2px;
+    background: var(--accent); border-radius: 2px;
+  }
+  .conv-title {
+    flex: 1; min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-size: 13px;
+  }
+  .conv-del {
+    background: transparent; border: none; color: var(--muted); cursor: pointer;
+    padding: 2px 4px; font-size: 14px; line-height: 1; opacity: 0;
+    border-radius: 4px;
+  }
+  .conv-item:hover .conv-del { opacity: 1; }
+  .conv-del:hover { color: var(--danger); background: rgba(255, 107, 107, 0.1); }
+
+  /* Settings */
+  .settings { padding: 14px; border-top: 1px solid var(--border); flex-shrink: 0;
+    max-height: 50vh; overflow-y: auto;
+  }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  textarea, input[type="number"] {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 7px 9px; font: inherit;
+    resize: vertical;
+  }
+  textarea { min-height: 80px; }
+  textarea:focus, input:focus { outline: none; border-color: var(--accent); }
+  .preset-row { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
+  .preset {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 3px 9px; border-radius: 999px; font-size: 11px; cursor: pointer;
+  }
+  .preset:hover { border-color: var(--accent); }
+  .row { display: flex; gap: 8px; }
+  .row .field { flex: 1; }
+
+  /* Main */
+  main { display: flex; flex-direction: column; height: 100vh; min-width: 0; }
+  .chat-header {
+    padding: 11px 18px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--panel);
+  }
+  .chat-header .title { font-weight: 600; }
+  .chat-header .status { font-size: 12px; color: var(--muted); }
+  .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #888; margin-right: 6px; vertical-align: middle; }
+  .status.up .dot { background: #4ade80; }
+  .status.down .dot { background: var(--danger); }
+
+  /* Toggle */
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+  .toggle-row label { font-size: 12px; color: var(--text); margin: 0; }
+  .toggle-row .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .switch {
+    position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; cursor: pointer; inset: 0;
+    background: var(--panel-3); border-radius: 999px; transition: 0.15s;
+  }
+  .slider::before {
+    content: ""; position: absolute; height: 14px; width: 14px; left: 3px; top: 3px;
+    background: var(--text); border-radius: 50%; transition: 0.15s;
+  }
+  .switch input:checked + .slider { background: var(--accent); }
+  .switch input:checked + .slider::before { transform: translateX(16px); background: #06121f; }
+  .switch input:disabled + .slider { opacity: 0.45; cursor: not-allowed; }
+
+  /* Search status chip in assistant bubble */
+  .search-status {
+    background: var(--panel-3); border: 1px solid var(--border);
+    border-radius: 999px; padding: 3px 10px; font-size: 11px;
+    color: var(--muted); display: inline-flex; align-items: center; gap: 6px;
+    margin-bottom: 6px;
+  }
+  .search-status.done { border-color: rgba(74, 222, 128, 0.4); }
+  .search-status .spinner {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    animation: pulse 1.2s infinite ease-in-out;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+
+  /* Citations */
+  .citations {
+    margin-top: 6px; padding: 8px 10px; background: rgba(255,255,255,0.02);
+    border-left: 2px solid var(--border); font-size: 11.5px; border-radius: 4px;
+  }
+  .citations-title { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+  .citations a {
+    color: var(--accent); text-decoration: none; line-height: 1.5;
+    display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    vertical-align: top;
+  }
+  .citations a:hover { text-decoration: underline; }
+  .citations .cit-row { color: var(--muted); margin-bottom: 3px; }
+
+  #messages {
+    flex: 1; overflow-y: auto; padding: 18px 22px;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .msg { display: flex; gap: 10px; max-width: 80%; }
+  .msg.user { align-self: flex-end; flex-direction: row-reverse; }
+  .avatar {
+    width: 30px; height: 30px; border-radius: 50%; background: var(--panel-2);
+    display: flex; align-items: center; justify-content: center; font-size: 13px; flex-shrink: 0;
+    border: 1px solid var(--border);
+  }
+  .bubble {
+    background: var(--assistant-bg); padding: 10px 14px; border-radius: 12px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .msg.user .bubble { background: var(--user-bg); }
+  .msg .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .msg.assistant .meta { text-align: left; }
+  .msg.user .meta { text-align: right; }
+
+  .empty { color: var(--muted); text-align: center; margin-top: 80px; font-size: 13px; }
+
+  /* Input */
+  .composer { border-top: 1px solid var(--border); padding: 12px 18px; background: var(--panel); }
+  .composer-inner { display: flex; gap: 8px; align-items: flex-end; }
+  .composer textarea { flex: 1; min-height: 44px; max-height: 200px; }
+  .composer .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  button.primary {
+    background: var(--accent); color: #06121f; border: none; padding: 8px 14px;
+    border-radius: 8px; font-weight: 600; cursor: pointer;
+  }
+  button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* While streaming */
+  aside.locked .conv-list-wrap, aside.locked .new-conv { pointer-events: none; opacity: 0.6; }
+
+  .cursor::after {
+    content: "▋"; opacity: 0.6; margin-left: 1px;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  @keyframes blink { to { visibility: hidden; } }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div class="side-section">
+    <h1>本地 Qwen 对话</h1>
+    <div class="sub">Qwen3.6-35B-A3B-4bit · 本地</div>
+  </div>
+
+  <div class="side-section">
+    <button class="new-conv" id="new-conv-btn">+ 新建对话</button>
+  </div>
+
+  <div class="conv-list-wrap">
+    <div class="conv-list-title">对话历史</div>
+    <div id="conv-list"></div>
+  </div>
+
+  <div class="settings">
+    <div class="field">
+      <label>角色预设(应用到当前对话)</label>
+      <div class="preset-row" id="presets"></div>
+    </div>
+    <div class="field">
+      <label for="system">系统提示词 (system prompt)</label>
+      <textarea id="system" placeholder="例如:你是黄山景区的资深导游,语气亲切,回答简短。"></textarea>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="max-tokens">max_tokens</label>
+        <input id="max-tokens" type="number" value="1024" min="32" max="4096" step="64" />
+      </div>
+      <div class="field">
+        <label for="temperature">temperature</label>
+        <input id="temperature" type="number" value="0.7" min="0" max="2" step="0.1" />
+      </div>
+    </div>
+    <div class="field" style="margin-bottom: 0;">
+      <div class="toggle-row">
+        <label for="web-search-toggle">联网搜索</label>
+        <span class="switch">
+          <input type="checkbox" id="web-search-toggle" />
+          <span class="slider"></span>
+        </span>
+      </div>
+      <div class="hint" id="web-search-hint">由模型判断是否联网,最多调用 2 次</div>
+    </div>
+  </div>
+</aside>
+
+<main>
+  <div class="chat-header">
+    <div class="title" id="conv-header-title">对话</div>
+    <div class="status" id="status"><span class="dot"></span><span id="status-text">检查中...</span></div>
+  </div>
+
+  <div id="messages"></div>
+
+  <div class="composer">
+    <div class="composer-inner">
+      <textarea id="input" placeholder="输入消息,Enter 发送,Shift+Enter 换行"></textarea>
+      <button class="primary" id="send-btn">发送</button>
+    </div>
+    <div class="hint">提示:历史保存在浏览器本地。点击左侧"+ 新建对话"开新对话。</div>
+  </div>
+</main>
+
+<script>
+// ============== 常量 / 存储 ==============
+const KEY_CONVS = "bot.conversations.v1";
+const KEY_ACTIVE = "bot.activeId.v1";
+const KEY_SETTINGS = "bot.settings.v1";
+
+const PRESETS = [
+  { name: "通用助手", prompt: "你是一个有帮助、诚实、礼貌的中文助手。" },
+  { name: "导游", prompt: "你是一名资深的中国景区导游,熟悉历史人文与实用攻略。回答简洁,带温度,优先给出可执行建议。" },
+  { name: "客服", prompt: "你是智慧旅游 SaaS 平台的客服。专业、耐心,优先用编号列表给出步骤。如遇无法解决的问题,提醒用户联系人工客服。" },
+  { name: "代码", prompt: "You are a senior software engineer. Answer concisely, give working code with brief rationale." },
+];
+
+// ============== 状态 ==============
+let convs = [];       // [{id, title, system, messages:[{role,content,stats?,citations?,searches?}], createdAt, updatedAt}]
+let activeId = null;
+let settings = { maxTokens: 1024, temperature: 0.7, webSearch: true };
+let serverCaps = { search: false, model: false };
+let streaming = false;
+
+// ============== DOM ==============
+const $ = (id) => document.getElementById(id);
+const messagesEl = $("messages");
+const inputEl = $("input");
+const sendBtn = $("send-btn");
+const newConvBtn = $("new-conv-btn");
+const systemEl = $("system");
+const presetsEl = $("presets");
+const statusEl = $("status");
+const statusText = $("status-text");
+const convListEl = $("conv-list");
+const convHeaderTitle = $("conv-header-title");
+const maxTokensEl = $("max-tokens");
+const temperatureEl = $("temperature");
+const sidebarEl = $("sidebar");
+const webSearchToggle = $("web-search-toggle");
+const webSearchHint = $("web-search-hint");
+
+// ============== 持久化 ==============
+function persistConvs() {
+  localStorage.setItem(KEY_CONVS, JSON.stringify(convs));
+  localStorage.setItem(KEY_ACTIVE, activeId || "");
+}
+function persistSettings() {
+  localStorage.setItem(KEY_SETTINGS, JSON.stringify(settings));
+}
+function loadFromStorage() {
+  try { convs = JSON.parse(localStorage.getItem(KEY_CONVS) || "[]"); } catch { convs = []; }
+  activeId = localStorage.getItem(KEY_ACTIVE) || null;
+  try {
+    const s = JSON.parse(localStorage.getItem(KEY_SETTINGS) || "{}");
+    if (s.maxTokens) settings.maxTokens = s.maxTokens;
+    if (s.temperature != null) settings.temperature = s.temperature;
+    if (s.webSearch != null) settings.webSearch = !!s.webSearch;
+  } catch {}
+}
+
+// ============== 工具 ==============
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+function getActive() { return convs.find(c => c.id === activeId); }
+function autoTitle(text) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "新对话";
+  return t.length > 22 ? t.slice(0, 22) + "…" : t;
+}
+
+// ============== Conv 操作 ==============
+function createConv(activate = true) {
+  const c = {
+    id: uid(),
+    title: "新对话",
+    system: "",
+    messages: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  convs.unshift(c);
+  if (activate) activeId = c.id;
+  persistConvs();
+  renderAll();
+  inputEl.focus();
+}
+function selectConv(id) {
+  if (streaming) return;
+  activeId = id;
+  persistConvs();
+  renderAll();
+}
+function deleteConv(id) {
+  if (streaming) return;
+  const idx = convs.findIndex(c => c.id === id);
+  if (idx === -1) return;
+  if (!confirm("确认删除这条对话?")) return;
+  convs.splice(idx, 1);
+  if (activeId === id) {
+    activeId = convs.length ? convs[0].id : null;
+  }
+  if (!activeId) createConv();
+  else { persistConvs(); renderAll(); }
+}
+
+// ============== 渲染 ==============
+function renderConvList() {
+  // 按 updatedAt 倒序
+  const sorted = [...convs].sort((a, b) => b.updatedAt - a.updatedAt);
+  convListEl.innerHTML = "";
+  sorted.forEach(c => {
+    const item = document.createElement("div");
+    item.className = "conv-item" + (c.id === activeId ? " active" : "");
+    const title = document.createElement("div");
+    title.className = "conv-title";
+    title.textContent = c.title || "新对话";
+    title.title = c.title;
+    title.onclick = () => selectConv(c.id);
+    const del = document.createElement("button");
+    del.className = "conv-del";
+    del.textContent = "×";
+    del.title = "删除";
+    del.onclick = (e) => { e.stopPropagation(); deleteConv(c.id); };
+    item.appendChild(title);
+    item.appendChild(del);
+    convListEl.appendChild(item);
+  });
+}
+function renderMessages() {
+  const conv = getActive();
+  messagesEl.innerHTML = "";
+  if (!conv || conv.messages.length === 0) {
+    const e = document.createElement("div");
+    e.className = "empty";
+    e.textContent = "还没有对话。在下方输入消息开始聊天。";
+    messagesEl.appendChild(e);
+    return;
+  }
+  conv.messages.forEach(m => {
+    appendMessageDOM(m.role, m.content, m.stats, m.citations, m.searches);
+  });
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+function appendMessageDOM(role, content, stats, citations, searches) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + role;
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = role === "user" ? "我" : "Q";
+  const box = document.createElement("div");
+
+  // 历史:搜索状态(已完成形态)
+  const statusHost = document.createElement("div");
+  if (Array.isArray(searches)) {
+    searches.forEach(s => statusHost.appendChild(makeSearchChip(s.query, s.freshness, true)));
+  }
+  box.appendChild(statusHost);
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = content;
+
+  const citEl = document.createElement("div");
+  if (Array.isArray(citations) && citations.length) {
+    renderCitations(citEl, citations);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  if (stats) meta.textContent = formatStats(stats);
+
+  box.appendChild(bubble);
+  box.appendChild(citEl);
+  box.appendChild(meta);
+  wrap.appendChild(avatar);
+  wrap.appendChild(box);
+  messagesEl.appendChild(wrap);
+  return { bubble, meta, citEl, statusHost };
+}
+
+function makeSearchChip(query, freshness, done) {
+  const chip = document.createElement("div");
+  chip.className = "search-status" + (done ? " done" : "");
+  const dot = document.createElement("span");
+  dot.className = "spinner";
+  if (done) dot.style.animation = "none";
+  chip.appendChild(dot);
+  const txt = document.createElement("span");
+  const frTag = (freshness && freshness !== "noLimit") ? ` · ${freshness}` : "";
+  txt.textContent = (done ? "已搜索: " : "正在搜索: ") + (query || "") + frTag;
+  chip.appendChild(txt);
+  return chip;
+}
+
+function renderCitations(el, items) {
+  el.className = "citations";
+  el.innerHTML = "";
+  const title = document.createElement("div");
+  title.className = "citations-title";
+  title.textContent = "参考来源";
+  el.appendChild(title);
+  items.forEach(c => {
+    const row = document.createElement("div");
+    row.className = "cit-row";
+    const a = document.createElement("a");
+    a.href = c.url; a.target = "_blank"; a.rel = "noopener";
+    a.textContent = `[${c.index}] ${c.title || c.url}`;
+    row.appendChild(a);
+    if (c.site || c.date) {
+      const s = document.createElement("span");
+      s.textContent = ` — ${[c.site, c.date].filter(Boolean).join(" · ")}`;
+      row.appendChild(s);
+    }
+    el.appendChild(row);
+  });
+}
+function renderActiveMeta() {
+  const conv = getActive();
+  if (!conv) { convHeaderTitle.textContent = "对话"; systemEl.value = ""; return; }
+  convHeaderTitle.textContent = conv.title || "新对话";
+  systemEl.value = conv.system || "";
+}
+function renderAll() {
+  renderConvList();
+  renderActiveMeta();
+  renderMessages();
+}
+function formatStats(s) {
+  const ttft = s.ttft_ms == null ? "—" : (s.ttft_ms + "ms");
+  return `TTFT ${ttft} · ${s.tokens} tokens · ${s.gen_s}s · ${s.tps} tok/s`;
+}
+
+// ============== 预设 ==============
+PRESETS.forEach((p) => {
+  const btn = document.createElement("button");
+  btn.className = "preset";
+  btn.textContent = p.name;
+  btn.onclick = () => {
+    systemEl.value = p.prompt;
+    const conv = getActive();
+    if (conv) { conv.system = p.prompt; conv.updatedAt = Date.now(); persistConvs(); }
+  };
+  presetsEl.appendChild(btn);
+});
+
+// ============== 健康检查 ==============
+async function checkHealth() {
+  try {
+    const r = await fetch("/api/health");
+    if (r.ok) {
+      const j = await r.json();
+      serverCaps = j;
+      if (j.model) {
+        statusEl.classList.add("up"); statusEl.classList.remove("down");
+        statusText.textContent = j.search ? "模型在线 · 联网可用" : "模型在线 · 未配置联网";
+      } else {
+        statusEl.classList.add("down"); statusEl.classList.remove("up");
+        statusText.textContent = "模型未启动";
+      }
+      applySearchCap();
+    }
+  } catch (e) {
+    statusEl.classList.add("down"); statusEl.classList.remove("up");
+    statusText.textContent = "bot 服务异常";
+  }
+}
+
+function applySearchCap() {
+  if (!serverCaps.search) {
+    webSearchToggle.checked = false;
+    webSearchToggle.disabled = true;
+    webSearchHint.textContent = "未配置 BOCHA_API_KEY,联网不可用";
+  } else {
+    webSearchToggle.disabled = false;
+    webSearchHint.textContent = "由模型判断是否联网,最多调用 2 次";
+  }
+}
+
+// ============== 发送 ==============
+async function send() {
+  if (streaming) return;
+  const text = inputEl.value.trim();
+  if (!text) return;
+  let conv = getActive();
+  if (!conv) { createConv(); conv = getActive(); }
+  inputEl.value = "";
+  inputEl.style.height = "";
+
+  // 用户消息入历史
+  conv.messages.push({ role: "user", content: text });
+  if (conv.messages.filter(m => m.role === "user").length === 1) {
+    conv.title = autoTitle(text);
+  }
+  conv.updatedAt = Date.now();
+  persistConvs();
+  renderConvList();
+  renderActiveMeta();
+
+  // 用户消息渲染 + 助手占位
+  // (renderMessages 重渲染会清空 streaming 状态,所以这里手动 append)
+  if (messagesEl.querySelector(".empty")) messagesEl.innerHTML = "";
+  appendMessageDOM("user", text);
+  const { bubble, meta, citEl, statusHost } = appendMessageDOM("assistant", "");
+  bubble.classList.add("cursor");
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  // 锁定 UI
+  streaming = true;
+  sendBtn.disabled = true;
+  sidebarEl.classList.add("locked");
+
+  const body = {
+    messages: conv.messages,
+    system: conv.system,
+    max_tokens: parseInt(maxTokensEl.value) || 1024,
+    temperature: parseFloat(temperatureEl.value) || 0.7,
+    web_search: !!(webSearchToggle.checked && !webSearchToggle.disabled),
+  };
+
+  let acc = "";
+  let stats = null;
+  let citations = [];
+  const searches = [];   // [{query, freshness}]
+  let activeChip = null;
+  const targetConvId = conv.id;  // 防止流中切换的边界(虽然已锁)
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const line = raw.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        const payload = JSON.parse(line.slice(6));
+        if (payload.type === "token") {
+          // 一旦开始出 token,把进行中的 chip 标记为完成
+          if (activeChip) {
+            activeChip.classList.add("done");
+            const dot = activeChip.querySelector(".spinner"); if (dot) dot.style.animation = "none";
+            const span = activeChip.querySelector("span:last-child");
+            if (span && span.textContent.startsWith("正在搜索")) {
+              span.textContent = "已" + span.textContent.slice(2);
+            }
+            activeChip = null;
+          }
+          acc += payload.text;
+          bubble.textContent = acc;
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        } else if (payload.type === "status" && payload.stage === "searching") {
+          // 上一次的 chip 关掉
+          if (activeChip) {
+            activeChip.classList.add("done");
+            const dot = activeChip.querySelector(".spinner"); if (dot) dot.style.animation = "none";
+            const span = activeChip.querySelector("span:last-child");
+            if (span && span.textContent.startsWith("正在搜索")) span.textContent = "已" + span.textContent.slice(2);
+          }
+          activeChip = makeSearchChip(payload.query, payload.freshness, false);
+          statusHost.appendChild(activeChip);
+          searches.push({ query: payload.query, freshness: payload.freshness });
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        } else if (payload.type === "citations") {
+          citations = payload.items || [];
+          renderCitations(citEl, citations);
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        } else if (payload.type === "done") {
+          stats = payload.stats;
+        } else if (payload.type === "error") {
+          // 错误信息以小字附加,不要污染回答正文
+          const err = document.createElement("div");
+          err.style.color = "var(--danger)"; err.style.fontSize = "12px"; err.style.marginTop = "4px";
+          err.textContent = "[错误] " + payload.message;
+          bubble.parentNode.insertBefore(err, citEl);
+        }
+      }
+    }
+  } catch (e) {
+    bubble.textContent = "[请求失败] " + e.message;
+    bubble.style.color = "var(--danger)";
+  } finally {
+    bubble.classList.remove("cursor");
+    streaming = false;
+    sendBtn.disabled = false;
+    sidebarEl.classList.remove("locked");
+    // 如果还有进行中的 chip(网络中断/出错),也标完成
+    if (activeChip) {
+      activeChip.classList.add("done");
+      const dot = activeChip.querySelector(".spinner"); if (dot) dot.style.animation = "none";
+    }
+    const target = convs.find(c => c.id === targetConvId);
+    if (target && acc) {
+      const msg = { role: "assistant", content: acc, stats };
+      if (citations.length) msg.citations = citations;
+      if (searches.length) msg.searches = searches;
+      target.messages.push(msg);
+      target.updatedAt = Date.now();
+      persistConvs();
+      if (stats) meta.textContent = formatStats(stats);
+      // 不调 renderConvList:title 没变,但 updatedAt 变了影响排序
+      renderConvList();
+    }
+  }
+}
+
+// ============== 事件 ==============
+sendBtn.onclick = send;
+newConvBtn.onclick = () => { if (!streaming) createConv(); };
+
+inputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+inputEl.addEventListener("input", () => {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
+});
+
+systemEl.addEventListener("input", () => {
+  const conv = getActive();
+  if (conv) { conv.system = systemEl.value; conv.updatedAt = Date.now(); persistConvs(); }
+});
+maxTokensEl.addEventListener("change", () => {
+  settings.maxTokens = parseInt(maxTokensEl.value) || 1024; persistSettings();
+});
+temperatureEl.addEventListener("change", () => {
+  settings.temperature = parseFloat(temperatureEl.value) || 0.7; persistSettings();
+});
+webSearchToggle.addEventListener("change", () => {
+  settings.webSearch = !!webSearchToggle.checked; persistSettings();
+});
+
+// ============== 初始化 ==============
+loadFromStorage();
+maxTokensEl.value = settings.maxTokens;
+temperatureEl.value = settings.temperature;
+webSearchToggle.checked = settings.webSearch;
+if (convs.length === 0) {
+  createConv();
+} else {
+  if (!convs.find(c => c.id === activeId)) activeId = convs[0].id;
+  renderAll();
+}
+checkHealth();
+setInterval(checkHealth, 15000);
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual envs
+.venv/
+
+# Secrets
+.env
+
+# 模型权重(数十 GB,不入库)
+local-llm/models/
+
+# Claude Code 本地状态
+.claude/
+
+# 项目方案文档(可能含敏感商业内容,需要时手动 add)
+*.docx
+
+# macOS
+.DS_Store
