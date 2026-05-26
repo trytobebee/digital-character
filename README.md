@@ -15,9 +15,9 @@ bot/server.py  (FastAPI, :8090)
     └──► api.bochaai.com/v1/web-search  (function calling 触发)
 ```
 
-- **本地推理**:Mac Apple Silicon + MLX,模型常驻 ~19GB 统一内存
+- **本地推理**:Mac Apple Silicon + MLX-VLM,模型常驻 ~21GB 统一内存
 - **联网检索**:模型自主判断是否调用 `web_search` tool,最多 3 次/请求
-- **多模态**:模型权重已含 vision/video tower,当前 `mlx_lm.server` runtime 只用 text 部分,切换 `mlx_vlm.server` 即可启用(TODO)
+- **多模态**:文本 + 图像理解可用;视频/音频接口由 mlx-vlm 提供,bot 前端暂未对接
 
 ## 快速开始
 
@@ -84,17 +84,22 @@ cd bot/
 - **健康监控** — 右上角实时显示模型与博查可用性
 - **性能指标** — 每条回答下显示 TTFT / tokens / decode 速度
 
-## 性能参考(M-series Mac,Qwen3.6-35B-A3B-4bit)
+## 性能参考(M-series Mac,Qwen3.6-35B-A3B-4bit,mlx-vlm runtime)
 
 | 场景 | 速度 |
 |---|---|
-| 流式 decode | ~55–57 tok/s |
+| 文本 decode(多轮)| ~50 tok/s |
 | 单轮 TTFT(热)| ~200–500ms |
 | 单轮 TTFT(联网,含 1 次 Bocha + 第二轮 prefill)| ~2–4s |
+| 图像理解(64x64 → 简单回答)| 单次 ~5s,峰值内存 21GB |
+
+> **Streaming 注意**:mlx-vlm 当前实现是"伪流式" — 中间发若干空 delta,最后一个 chunk 一次性塞入完整 content。逐 token 视觉效果丢失,但内容正常。前端可做"假流式重放"补救(TODO)。
 
 ## 路线图
 
-- [ ] 切到 `mlx_vlm.server` 启用图像/视频理解
+- [x] ~~切到 `mlx_vlm.server` 启用图像理解~~ ✅ 已切换
+- [ ] Bot 前端添加图片上传(content blocks 已是 OpenAI 标准格式,后端透传即可)
+- [ ] 前端"假流式"重放,弥补 mlx-vlm 伪流式的视觉缺失
 - [ ] PDF 文本提取(PyMuPDF)+ 扫描型 PDF 走 VL
 - [ ] 工具扩展:天气 / 票务 / 航班(智慧旅游场景特化)
 - [ ] 上下文窗口管理(滑窗 + 历史摘要)
