@@ -54,13 +54,24 @@ TOOLS_SPEC = [{
     "function": {
         "name": "web_search",
         "description": (
-            "联网搜索获取最新的网页信息。当用户问题涉及实时/最新/近期事件、"
-            "当前数据、新发布的内容,或你不确定的具体事实时,调用此工具。"
-            "对常识问题、写作任务、代码问题不要调用。\n"
-            "重要约束:\n"
-            "1) 对一个用户问题最多调用 1-2 次。\n"
-            "2) 不要并行发起多个相似查询,也不要按'类别'(政治/经济/科技/...)分别检索。\n"
-            "3) 使用一个综合、足够具体的查询词即可;若一次搜索结果不充分,再换关键词重搜一次,最多到此为止。\n"
+            "通过博查搜索引擎从主流公开网站(新闻、财经、百科、论文、官方站点等)"
+            "检索当前可获取的公开信息。这是检索公开数据,不是给出投资/医疗/法律建议,"
+            "你只是把搜索结果转述给用户。\n\n"
+            "必须调用的情况(不允许以'我无法访问实时数据''我不能提供投资建议'等理由拒答):\n"
+            "- 用户明确要求'搜索/联网/查一下/查询/帮我查'\n"
+            "- 涉及实时或近实时数据:股价、市值、汇率、商品价格、天气、赛事比分、航班/列车状态\n"
+            "- 涉及训练截止之后的事件:2025 年之后的新闻、发布、人事、政策、论文、产品\n"
+            "- 涉及'今天/最新/最近/本周/本月/刚刚/此刻/现在的'等时间限定的事实性问题\n"
+            "- 用户提及你不熟悉的具体公司/产品/人物/论文,需要核实事实\n\n"
+            "不应调用的情况:\n"
+            "- 纯写作任务(写诗、起草邮件、翻译、扩写)\n"
+            "- 代码/算法/数学解释\n"
+            "- 静态常识(历史事件、基础概念、定义)\n"
+            "- 用户的主观偏好/意见请求\n\n"
+            "调用纪律:\n"
+            "1) 一次提问最多调用 1-2 次本工具。\n"
+            "2) 不要并行发起多个相似查询,也不要按类别(政治/经济/科技/...)逐一检索。\n"
+            "3) 使用一个综合、足够具体的查询词;一次结果不充分时,再换关键词重搜一次,到此为止。\n"
             "4) 拿到结果后直接基于结果作答,不要为了'更全面'反复检索。"
         ),
         "parameters": {
@@ -88,7 +99,10 @@ TOOLS_SPEC = [{
 # ---------- 数据模型 ----------
 class Message(BaseModel):
     role: str
-    content: str
+    # content 可以是字符串 (纯文本) 或 OpenAI content blocks 数组 (多模态):
+    #   [{"type":"text","text":"..."},
+    #    {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]
+    content: str | list[dict[str, Any]]
 
 
 class ChatRequest(BaseModel):
@@ -97,6 +111,19 @@ class ChatRequest(BaseModel):
     max_tokens: int = 1024
     temperature: float = 0.7
     web_search: bool = False
+
+
+def msg_text(content: str | list[dict[str, Any]]) -> str:
+    """从可能是多模态的 content 里抽出纯文本(用于日志/搜索决策的可读化)"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
 
 
 # ---------- Bocha 搜索 ----------
@@ -187,6 +214,14 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     msgs.extend(m.model_dump() for m in req.messages)
 
     use_tools = bool(req.web_search and BOCHA_API_KEY)
+    # 诊断日志:显示请求关键字段,排查 UI 联网开关是否真的发了上来
+    last_user_msg = next((m for m in reversed(req.messages) if m.role == "user"), None)
+    last_user_text = msg_text(last_user_msg.content) if last_user_msg else ""
+    has_image = isinstance(last_user_msg.content, list) and any(
+        isinstance(b, dict) and b.get("type") == "image_url"
+        for b in last_user_msg.content
+    ) if last_user_msg else False
+    print(f"[chat] web_search={req.web_search}  use_tools={use_tools}  has_image={has_image}  msg={last_user_text[:60]!r}", flush=True)
 
     async def gen():
         all_citations: list[dict] = []
@@ -248,7 +283,9 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 return
 
             if not tool_calls_acc:
+                print(f"[chat]   loop={loops} no tool_calls, content_len={len(content_acc)}", flush=True)
                 break  # 模型直接回答完毕
+            print(f"[chat]   loop={loops} got {len(tool_calls_acc)} tool_calls", flush=True)
 
             # 模型要调工具:构造 assistant 消息 + 执行 + tool 消息
             # 单轮内若并行发了过多 tool_calls,只执行剩余配额数那么多;但每个 tool_call 仍需对应 tool 消息回写

@@ -191,10 +191,42 @@
   .empty { color: var(--muted); text-align: center; margin-top: 80px; font-size: 13px; }
 
   /* Input */
-  .composer { border-top: 1px solid var(--border); padding: 12px 18px; background: var(--panel); }
+  .composer { border-top: 1px solid var(--border); padding: 12px 18px; background: var(--panel); transition: background 0.1s; }
+  .composer.dragover { background: rgba(106, 166, 255, 0.07); border-top-color: var(--accent); }
   .composer-inner { display: flex; gap: 8px; align-items: flex-end; }
   .composer textarea { flex: 1; min-height: 44px; max-height: 200px; }
   .composer .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+  .attach-btn {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+    width: 40px; height: 44px; border-radius: 8px; cursor: pointer; font-size: 16px;
+    flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    padding: 0; line-height: 1;
+  }
+  .attach-btn:hover { color: var(--text); border-color: var(--accent); }
+  .attach-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .attachments-preview {
+    display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px;
+  }
+  .attachments-preview:empty { display: none; }
+  .thumb {
+    position: relative; width: 60px; height: 60px; border-radius: 6px;
+    border: 1px solid var(--border); overflow: hidden; background: var(--panel-2);
+  }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb .del {
+    position: absolute; top: 2px; right: 2px; width: 16px; height: 16px;
+    background: rgba(0,0,0,0.65); color: #fff; border: none; border-radius: 50%;
+    cursor: pointer; font-size: 11px; line-height: 14px; padding: 0;
+  }
+  .thumb .del:hover { background: var(--danger); }
+
+  .msg-image {
+    display: block; max-width: 320px; max-height: 320px; border-radius: 8px;
+    margin-top: 6px; cursor: pointer; border: 1px solid var(--border);
+  }
+  .msg-image:first-child, .bubble > .msg-image:first-of-type { margin-top: 0; }
   button.primary {
     background: var(--accent); color: #06121f; border: none; padding: 8px 14px;
     border-radius: 8px; font-weight: 600; cursor: pointer;
@@ -268,12 +300,15 @@
 
   <div id="messages"></div>
 
-  <div class="composer">
+  <div class="composer" id="composer">
+    <div class="attachments-preview" id="attachments-preview"></div>
     <div class="composer-inner">
-      <textarea id="input" placeholder="输入消息,Enter 发送,Shift+Enter 换行"></textarea>
+      <input type="file" id="file-input" accept="image/*" multiple hidden />
+      <button class="attach-btn" id="attach-btn" title="附加图片 (也可粘贴或拖拽)">📎</button>
+      <textarea id="input" placeholder="输入消息,Enter 发送,Shift+Enter 换行。粘贴或拖拽可附加图片。"></textarea>
       <button class="primary" id="send-btn">发送</button>
     </div>
-    <div class="hint">提示:历史保存在浏览器本地。点击左侧"+ 新建对话"开新对话。</div>
+    <div class="hint">提示:历史保存在浏览器本地。支持粘贴截图/拖拽图片附加到消息(单张 ≤ 5MB)。</div>
   </div>
 </main>
 
@@ -292,10 +327,14 @@ const PRESETS = [
 
 // ============== 状态 ==============
 let convs = [];       // [{id, title, system, messages:[{role,content,stats?,citations?,searches?}], createdAt, updatedAt}]
+                      // content 可以是 string 或 OpenAI content blocks 数组 (含图片时为数组)
 let activeId = null;
 let settings = { maxTokens: 1024, temperature: 0.7, webSearch: true };
 let serverCaps = { search: false, model: false };
 let streaming = false;
+let pendingAttachments = [];  // [{url:"data:image/...;base64,...", mime, name}]
+
+const MAX_ATTACH_BYTES = 5 * 1024 * 1024;  // 单张图最大 5MB
 
 // ============== DOM ==============
 const $ = (id) => document.getElementById(id);
@@ -314,6 +353,10 @@ const temperatureEl = $("temperature");
 const sidebarEl = $("sidebar");
 const webSearchToggle = $("web-search-toggle");
 const webSearchHint = $("web-search-hint");
+const composerEl = $("composer");
+const fileInputEl = $("file-input");
+const attachBtn = $("attach-btn");
+const attachPreviewEl = $("attachments-preview");
 
 // ============== 持久化 ==============
 function persistConvs() {
@@ -433,7 +476,7 @@ function appendMessageDOM(role, content, stats, citations, searches) {
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = content;
+  renderBubbleContent(bubble, content);
 
   const citEl = document.createElement("div");
   if (Array.isArray(citations) && citations.length) {
@@ -451,6 +494,31 @@ function appendMessageDOM(role, content, stats, citations, searches) {
   wrap.appendChild(box);
   messagesEl.appendChild(wrap);
   return { bubble, meta, citEl, statusHost };
+}
+
+function renderBubbleContent(bubble, content) {
+  bubble.innerHTML = "";
+  if (typeof content === "string") {
+    bubble.textContent = content;
+    return;
+  }
+  if (Array.isArray(content)) {
+    for (const b of content) {
+      if (b && b.type === "text") {
+        const t = document.createElement("div");
+        t.textContent = b.text || "";
+        t.style.whiteSpace = "pre-wrap";
+        bubble.appendChild(t);
+      } else if (b && b.type === "image_url") {
+        const img = document.createElement("img");
+        img.src = b.image_url?.url || "";
+        img.className = "msg-image";
+        img.alt = "图片";
+        img.onclick = () => window.open(img.src, "_blank");
+        bubble.appendChild(img);
+      }
+    }
+  }
 }
 
 function makeSearchChip(query, freshness, done) {
@@ -505,6 +573,92 @@ function formatStats(s) {
   return `TTFT ${ttft} · ${s.tokens} tokens · ${s.gen_s}s · ${s.tps} tok/s`;
 }
 
+// ============== 附件(图片) ==============
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+}
+
+async function addAttachmentFile(file) {
+  if (!file.type.startsWith("image/")) return;
+  if (file.size > MAX_ATTACH_BYTES) {
+    alert(`图片过大(${(file.size/1024/1024).toFixed(1)}MB),上限 5MB`);
+    return;
+  }
+  try {
+    const url = await readFileAsDataURL(file);
+    pendingAttachments.push({ url, mime: file.type, name: file.name || "image" });
+    renderAttachments();
+  } catch (e) {
+    console.error("read file failed", e);
+  }
+}
+
+function removeAttachment(idx) {
+  pendingAttachments.splice(idx, 1);
+  renderAttachments();
+}
+
+function renderAttachments() {
+  attachPreviewEl.innerHTML = "";
+  pendingAttachments.forEach((a, i) => {
+    const wrap = document.createElement("div");
+    wrap.className = "thumb";
+    const img = document.createElement("img");
+    img.src = a.url; img.alt = a.name;
+    const del = document.createElement("button");
+    del.className = "del"; del.textContent = "×"; del.title = "移除";
+    del.onclick = () => removeAttachment(i);
+    wrap.appendChild(img);
+    wrap.appendChild(del);
+    attachPreviewEl.appendChild(wrap);
+  });
+}
+
+attachBtn.addEventListener("click", () => fileInputEl.click());
+fileInputEl.addEventListener("change", async (e) => {
+  for (const f of e.target.files) await addAttachmentFile(f);
+  fileInputEl.value = "";  // 允许再次选同一文件
+});
+
+// 粘贴(textarea 上)
+inputEl.addEventListener("paste", async (e) => {
+  const items = e.clipboardData?.items || [];
+  let handled = false;
+  for (const it of items) {
+    if (it.kind === "file" && it.type.startsWith("image/")) {
+      e.preventDefault();
+      const f = it.getAsFile();
+      if (f) { await addAttachmentFile(f); handled = true; }
+    }
+  }
+  // 没有图就让默认粘贴行为继续
+});
+
+// 拖拽(整个 composer)
+["dragenter", "dragover"].forEach(ev => {
+  composerEl.addEventListener(ev, (e) => {
+    if (e.dataTransfer?.types?.includes("Files")) {
+      e.preventDefault();
+      composerEl.classList.add("dragover");
+    }
+  });
+});
+["dragleave", "drop"].forEach(ev => {
+  composerEl.addEventListener(ev, (e) => {
+    if (ev === "drop") e.preventDefault();
+    composerEl.classList.remove("dragover");
+  });
+});
+composerEl.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  for (const f of e.dataTransfer.files || []) await addAttachmentFile(f);
+});
+
 // ============== 预设 ==============
 PRESETS.forEach((p) => {
   const btn = document.createElement("button");
@@ -555,26 +709,47 @@ function applySearchCap() {
 async function send() {
   if (streaming) return;
   const text = inputEl.value.trim();
-  if (!text) return;
+  if (!text && pendingAttachments.length === 0) return;
   let conv = getActive();
   if (!conv) { createConv(); conv = getActive(); }
   inputEl.value = "";
   inputEl.style.height = "";
 
+  // 组装 user content:有图就是 OpenAI content blocks 数组,否则字符串
+  let userContent;
+  if (pendingAttachments.length > 0) {
+    userContent = [];
+    if (text) userContent.push({ type: "text", text });
+    for (const a of pendingAttachments) {
+      userContent.push({ type: "image_url", image_url: { url: a.url } });
+    }
+  } else {
+    userContent = text;
+  }
+  // 清空待发附件
+  pendingAttachments = [];
+  renderAttachments();
+
   // 用户消息入历史
-  conv.messages.push({ role: "user", content: text });
+  conv.messages.push({ role: "user", content: userContent });
   if (conv.messages.filter(m => m.role === "user").length === 1) {
-    conv.title = autoTitle(text);
+    conv.title = autoTitle(text || "[图片]");
   }
   conv.updatedAt = Date.now();
-  persistConvs();
+  try {
+    persistConvs();
+  } catch (e) {
+    // localStorage 超额(大图过多)— 提示用户但不阻断发送
+    console.warn("localStorage write failed:", e);
+    alert("浏览器本地存储空间不足(可能是图片过多)。本次对话仍会发送,但历史可能无法持久化。");
+  }
   renderConvList();
   renderActiveMeta();
 
   // 用户消息渲染 + 助手占位
   // (renderMessages 重渲染会清空 streaming 状态,所以这里手动 append)
   if (messagesEl.querySelector(".empty")) messagesEl.innerHTML = "";
-  appendMessageDOM("user", text);
+  appendMessageDOM("user", userContent);
   const { bubble, meta, citEl, statusHost } = appendMessageDOM("assistant", "");
   bubble.classList.add("cursor");
   messagesEl.scrollTop = messagesEl.scrollHeight;
