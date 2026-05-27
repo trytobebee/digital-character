@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,32 @@ MAX_TOOL_LOOPS = 2          # 最多与模型来回 2 轮 tool 协商
 MAX_TOTAL_TOOL_CALLS = 3    # 单次请求总共最多执行的 web_search 次数(无论并行还是串行)
 SEARCH_COUNT = 8            # 每次 web_search 返回结果数(给模型更多上下文,减少它重搜的动机)
 SEARCH_TIMEOUT_S = 15.0
+
+# 当用户消息含以下"严格今天"词时,后端把 freshness 兜底改写成今日 YYYY-MM-DD,
+# 收紧博查的过去 24 小时滚动窗口(避免拿到昨天的内容)
+TODAY_STRICT_KEYWORDS = ("今天", "此刻", "现在", "刚刚", "刚才", "今晨", "今早", "今晚", "今夜")
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_FRESHNESS_ENUMS = {"noLimit", "oneDay", "oneWeek", "oneMonth", "oneYear"}
+
+
+def normalize_freshness(fr: str | None) -> str:
+    """模型现在可以填精确日期了,做一层后端 validate,非法值兜底为 noLimit"""
+    if not fr:
+        return "noLimit"
+    if fr in _FRESHNESS_ENUMS:
+        return fr
+    if _DATE_RE.match(fr):
+        return fr
+    return "noLimit"
+
+
+def maybe_override_to_today(fr: str, user_text: str) -> str:
+    """方案 B:用户说'今天/此刻/现在/刚刚'时,把 oneDay/noLimit 收紧到精确今日 YYYY-MM-DD"""
+    if fr in ("oneDay", "noLimit") and any(kw in user_text for kw in TODAY_STRICT_KEYWORDS):
+        return time.strftime("%Y-%m-%d")
+    return fr
+
 
 # 命中以下关键词时,第 1 轮强制 tool_choice=web_search,绕过模型 RLHF 反射 + 历史污染
 # (后续轮次仍然 auto,让模型自己决定要不要二次搜索 / 直接答)
@@ -99,10 +126,16 @@ TOOLS_SPEC = [{
                 },
                 "freshness": {
                     "type": "string",
-                    "enum": ["noLimit", "oneDay", "oneWeek", "oneMonth", "oneYear"],
                     "description": (
-                        "时间范围过滤:'今天/最新/刚刚/此刻'用 oneDay;'本周/这几天'用 oneWeek;"
-                        "'本月/最近一个月'用 oneMonth;'今年'用 oneYear;不确定就用 noLimit。"
+                        "时间范围过滤。可选值有两类:\n"
+                        "(a) 枚举: noLimit / oneDay / oneWeek / oneMonth / oneYear\n"
+                        "(b) 精确日期: YYYY-MM-DD 格式 (如 2026-05-27)\n"
+                        "选用建议:\n"
+                        "- '今天/此刻/现在/刚刚' → 用今日的 YYYY-MM-DD (绝不要用 oneDay,后者是过去 24 小时滚动窗口,会含昨天内容)\n"
+                        "- '本周/最近几天' → oneWeek\n"
+                        "- '本月/最近一个月' → oneMonth\n"
+                        "- '今年' → oneYear\n"
+                        "- 不确定就用 noLimit"
                     ),
                 },
             },
@@ -262,6 +295,7 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 and loops < MAX_TOOL_LOOPS
                 and total_tool_calls < MAX_TOTAL_TOOL_CALLS
             )
+            print(f"[chat]   loop={loops} ENTRY allow_tools={allow_tools} total_calls={total_tool_calls}", flush=True)
             kwargs: dict[str, Any] = dict(
                 model=MODEL,
                 messages=msgs,
@@ -355,7 +389,12 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
 
                 if name == "web_search":
                     q = args.get("query", "") or ""
-                    fr = args.get("freshness", "noLimit") or "noLimit"
+                    fr_raw = args.get("freshness", "noLimit") or "noLimit"
+                    fr = normalize_freshness(fr_raw)
+                    fr_after = maybe_override_to_today(fr, last_user_text)
+                    if fr_after != fr:
+                        print(f"[chat]   freshness override: {fr_raw!r} -> {fr_after!r}", flush=True)
+                    fr = fr_after
                     yield sse({"type": "status", "stage": "searching", "query": q, "freshness": fr})
                     try:
                         payload = await bocha_search(q, fr)
