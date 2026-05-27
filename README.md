@@ -5,12 +5,12 @@
 ## 架构
 
 ```
-浏览器 (index.html)
-    │  SSE
+浏览器 (index.html, 文本+图片)
+    │  SSE / OpenAI content blocks
     ▼
 bot/server.py  (FastAPI, :8090)
     │
-    ├──► mlx_lm.server (:8080)  ─ 本地 Qwen3.6-35B-A3B-4bit
+    ├──► mlx_vlm.server (:8080)  ─ 本地 Qwen3.6-35B-A3B-4bit (文本 + 视觉)
     │
     └──► api.bochaai.com/v1/web-search  (function calling 触发)
 ```
@@ -78,7 +78,8 @@ cd bot/
 ## Bot 已实现的功能
 
 - **流式对话** — SSE 逐 token 推送,光标动画
-- **多对话管理** — 左侧对话列表,新建/切换/删除,localStorage 持久化跨刷新
+- **图像输入** — 📎 按钮 / Cmd+V 粘贴截图 / 拖拽图片到窗口,支持多图;OpenAI content blocks 透传给 mlx-vlm,模型直接看图作答
+- **多对话管理** — 左侧对话列表,新建/切换/删除,localStorage 持久化跨刷新(含图片消息)
 - **角色预设** — 通用助手 / 导游 / 客服 / 代码 四个 system prompt 模板
 - **联网搜索(博查)** — function calling 自主触发,带 freshness 时间过滤;气泡下方展示引用源
 - **健康监控** — 右上角实时显示模型与博查可用性
@@ -97,10 +98,12 @@ cd bot/
 
 ## 路线图
 
-- [x] ~~切到 `mlx_vlm.server` 启用图像理解~~ ✅ 已切换
-- [ ] Bot 前端添加图片上传(content blocks 已是 OpenAI 标准格式,后端透传即可)
+- [x] ~~切到 `mlx_vlm.server` 启用图像理解~~ ✅
+- [x] ~~Bot 前端添加图片上传(点击/粘贴/拖拽)~~ ✅
 - [ ] 前端"假流式"重放,弥补 mlx-vlm 伪流式的视觉缺失
 - [ ] PDF 文本提取(PyMuPDF)+ 扫描型 PDF 走 VL
+- [ ] 历史污染应对:长对话拒答模式滚雪球时的提示/降级策略
+- [ ] 关键词硬路由:`查/搜/股价/天气` 命中即强制 `tool_choice=web_search`,绕过模型 RLHF 反射
 - [ ] 工具扩展:天气 / 票务 / 航班(智慧旅游场景特化)
 - [ ] 上下文窗口管理(滑窗 + 历史摘要)
 - [ ] 部署:把 bot + 模型打包成 SaaS 多租户后端
