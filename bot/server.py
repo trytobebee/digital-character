@@ -98,8 +98,42 @@ aclient = AsyncOpenAI(base_url=UPSTREAM_BASE_URL, api_key="not-needed")
 app = FastAPI()
 
 
-# ---------- Tool schema ----------
-TOOLS_SPEC = [{
+# ---------- 当前时刻工具(无 API 依赖,纯本机时间)----------
+WEEKDAY_ZH = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+
+def current_time_payload() -> dict[str, Any]:
+    """统一组装本机当前时间信息(供注入 + tool 返回复用)"""
+    lt = time.localtime()
+    wd = WEEKDAY_ZH[lt.tm_wday]
+    return {
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%S", lt),
+        "date": time.strftime("%Y-%m-%d", lt),
+        "time": time.strftime("%H:%M:%S", lt),
+        "weekday": wd,
+        "timezone": time.strftime("%Z", lt) or "本机时区",
+        "friendly": time.strftime("%Y年%m月%d日 ", lt) + wd + time.strftime(" %H:%M:%S", lt),
+    }
+
+
+GET_TIME_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_current_time",
+        "description": (
+            "获取服务器当前时刻(本机时区,通常即中国标准时间 UTC+8)。"
+            "返回 ISO 时间戳、日期、时间、星期、时区等字段。\n"
+            "用户问'现在几点了''当前时间''今天什么日期''今天星期几'"
+            "等关于此刻系统时间的问题时调用,确保答案是最新的实时时间,"
+            "而不是凭训练记忆猜测。"
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
+# ---------- Tool schema (web_search) ----------
+WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
@@ -149,7 +183,7 @@ TOOLS_SPEC = [{
             "required": ["query"],
         },
     },
-}]
+}
 
 
 # ---------- 数据模型 ----------
@@ -328,19 +362,24 @@ def sse(event: dict[str, Any]) -> str:
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     msgs: list[dict[str, Any]] = []
+    sys_parts: list[str] = []
     if req.system and req.system.strip():
-        sys_text = req.system.strip()
-    else:
-        sys_text = ""
-    # 若开了联网,把时间常识塞进 system,模型才知道"今天"是哪天
+        sys_parts.append(req.system.strip())
+    # 永远注入当前时刻 — 这样模型问'几点了/今天星期几'时不用走任何 tool 就能答
+    now = current_time_payload()
+    sys_parts.append(
+        f"当前时刻: {now['friendly']} ({now['timezone']})。"
+        f"无论用户用什么角色与你对话,涉及'现在几点/今天日期/星期几/此刻'类系统时间问题时,"
+        f"直接基于此值回答,不需要联网搜索。"
+    )
     if req.web_search and BOCHA_API_KEY:
-        today = time.strftime("%Y-%m-%d")
+        today = now["date"]
         extra = (
             f"当前日期: {today}。当问题涉及实时信息、最新事件、近期数据、"
             "或你不确定的具体事实时,优先调用 web_search 工具。常识/代码/写作类问题不要调用。"
             f"对一个用户问题最多调用 {MAX_TOTAL_TOOL_CALLS} 次 web_search,"
             "不要并行发起多个相似查询,也不要按类别(政治/经济/科技/...)逐一检索。"
-            "拿到结果后直接综合回答,不要为了'更全面'反复重搜。\n\n"
+            "拿到结果后直接综合回答,不要为了'更全面'反复重搜。\n"
             "【重要:对搜索结果的诚实交代】\n"
             "1) 搜索返回 0 条结果:直接告诉用户'未在博查索引中找到 <主题> 的相关内容',"
             "可能原因是该话题暂未被收录或关键词需要调整,请用户换种问法或稍后再试。"
@@ -353,12 +392,18 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "4) 绝对不要捏造具体数字、价格、温度、比分、人事任命等事实。"
             "宁可说'未拿到此数据',也不要给假数据。"
         )
-        sys_text = (sys_text + "\n\n" + extra).strip() if sys_text else extra
+        sys_parts.append(extra)
+    sys_text = "\n\n".join(sys_parts).strip()
     if sys_text:
         msgs.append({"role": "system", "content": sys_text})
     msgs.extend(m.model_dump() for m in req.messages)
 
-    use_tools = bool(req.web_search and BOCHA_API_KEY)
+    # 工具装配:get_current_time 永远可用;web_search 仅在开启 + 有 key 时可用
+    use_search = bool(req.web_search and BOCHA_API_KEY)
+    tools_for_request: list[dict[str, Any]] = [GET_TIME_TOOL]
+    if use_search:
+        tools_for_request.append(WEB_SEARCH_TOOL)
+    use_tools = bool(tools_for_request)
     # 诊断日志:显示请求关键字段,排查 UI 联网开关是否真的发了上来
     last_user_msg = next((m for m in reversed(req.messages) if m.role == "user"), None)
     last_user_text = msg_text(last_user_msg.content) if last_user_msg else ""
@@ -367,8 +412,9 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         for b in last_user_msg.content
     ) if last_user_msg else False
     # 关键词硬路由:命中即强制第 1 轮调 web_search,绕过模型 RLHF 反射 + 历史污染
+    # 只在 web_search 工具实际可用时才考虑硬路由
     matched_kws = [kw for kw in FORCE_SEARCH_KEYWORDS if kw in last_user_text]
-    force_search = use_tools and bool(matched_kws)
+    force_search = use_search and bool(matched_kws)
     print(
         f"[chat] web_search={req.web_search}  use_tools={use_tools}  "
         f"force_search={force_search}  matched_kws={matched_kws[:5]}  "
@@ -400,7 +446,7 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 stream=True,
             )
             if allow_tools:
-                kwargs["tools"] = TOOLS_SPEC
+                kwargs["tools"] = tools_for_request
                 if loops == 0 and force_search:
                     # 第 1 轮强制调 web_search;后续轮次回到 auto 让模型自己决定
                     kwargs["tool_choice"] = {
@@ -483,7 +529,15 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     })
                     continue
 
-                if name == "web_search":
+                if name == "get_current_time":
+                    payload = current_time_payload()
+                    total_tool_calls += 1
+                    msgs.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    })
+                elif name == "web_search":
                     q = args.get("query", "") or ""
                     fr_raw = args.get("freshness", "noLimit") or "noLimit"
                     fr = normalize_freshness(fr_raw)
