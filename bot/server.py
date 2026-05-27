@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -22,9 +23,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import fitz  # PyMuPDF
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.requests import Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from openai import AsyncOpenAI
@@ -44,6 +46,11 @@ MAX_TOOL_LOOPS = 2          # 最多与模型来回 2 轮 tool 协商
 MAX_TOTAL_TOOL_CALLS = 3    # 单次请求总共最多执行的 web_search 次数(无论并行还是串行)
 SEARCH_COUNT = 8            # 每次 web_search 返回结果数(给模型更多上下文,减少它重搜的动机)
 SEARCH_TIMEOUT_S = 15.0
+
+PDF_MAX_BYTES = 20 * 1024 * 1024  # 单个 PDF 最大 20MB
+PDF_MAX_PAGES = 20                # 一份 PDF 最多处理 20 页
+PDF_SPARSE_TEXT_CHARS = 30        # 一页文字少于此阈值视为扫描页,改用图像
+PDF_RENDER_DPI = 120              # 扫描页渲染 DPI(质量 vs 体积平衡)
 
 # 当用户消息含以下"严格今天"词时,后端把 freshness 兜底改写成今日 YYYY-MM-DD,
 # 收紧博查的过去 24 小时滚动窗口(避免拿到昨天的内容)
@@ -218,10 +225,88 @@ def format_search_results(payload: dict[str, Any], offset: int) -> tuple[str, li
     return text, citations
 
 
+# ---------- PDF 解析 ----------
+def parse_pdf_to_blocks(data: bytes) -> dict[str, Any]:
+    """
+    用 PyMuPDF 把 PDF 解析为 OpenAI content blocks。
+    每页有正文 (>= PDF_SPARSE_TEXT_CHARS 字符) 走 text block;
+    稀疏/扫描页走 image_url block(渲染为 PNG)。
+
+    返回:
+      content_blocks: list[dict] — 可直接拼到 user message 的 content
+      stats: 文件元信息(总页数 / 文本页数 / 图像页数 / 是否截断)
+    """
+    doc = fitz.open(stream=data, filetype="pdf")
+    total_pages = doc.page_count
+    process_count = min(total_pages, PDF_MAX_PAGES)
+
+    blocks: list[dict[str, Any]] = []
+    text_pages = 0
+    image_pages = 0
+
+    for i in range(process_count):
+        page = doc[i]
+        text = (page.get_text() or "").strip()
+        if len(text) >= PDF_SPARSE_TEXT_CHARS:
+            blocks.append({
+                "type": "text",
+                "text": f"=== 第 {i + 1} 页 / 共 {total_pages} 页 ===\n{text}",
+            })
+            text_pages += 1
+        else:
+            # 渲染为 PNG 走 VL 路径
+            pix = page.get_pixmap(dpi=PDF_RENDER_DPI)
+            png_bytes = pix.tobytes("png")
+            b64 = base64.b64encode(png_bytes).decode()
+            blocks.append({
+                "type": "text",
+                "text": f"=== 第 {i + 1} 页 / 共 {total_pages} 页 (扫描页,见下图) ===",
+            })
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            })
+            image_pages += 1
+
+    doc.close()
+    return {
+        "content_blocks": blocks,
+        "stats": {
+            "total_pages": total_pages,
+            "processed": process_count,
+            "text_pages": text_pages,
+            "image_pages": image_pages,
+            "truncated": total_pages > PDF_MAX_PAGES,
+        },
+    }
+
+
 # ---------- 路由 ----------
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(HERE / "index.html")
+
+
+@app.post("/api/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
+    """接收 PDF 文件,返回 content_blocks(text + image_url 混合)+ stats。"""
+    if not (file.filename or "").lower().endswith(".pdf") and file.content_type != "application/pdf":
+        return JSONResponse({"error": "仅支持 .pdf 文件"}, status_code=400)
+    data = await file.read()
+    if not data:
+        return JSONResponse({"error": "文件为空"}, status_code=400)
+    if len(data) > PDF_MAX_BYTES:
+        return JSONResponse(
+            {"error": f"PDF 过大 ({len(data)/1024/1024:.1f}MB),上限 {PDF_MAX_BYTES//1024//1024}MB"},
+            status_code=400,
+        )
+    try:
+        result = parse_pdf_to_blocks(data)
+    except Exception as e:
+        return JSONResponse({"error": f"PDF 解析失败: {e}"}, status_code=400)
+    result["filename"] = file.filename
+    print(f"[pdf] {file.filename!r}  pages={result['stats']['processed']}/{result['stats']['total_pages']}  text={result['stats']['text_pages']}  image={result['stats']['image_pages']}", flush=True)
+    return JSONResponse(result)
 
 
 @app.get("/api/health")

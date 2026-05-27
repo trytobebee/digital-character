@@ -5,9 +5,9 @@ cd "$(dirname "$0")"
 
 VENV_PY="../local-llm/.venv/bin/python"
 
-if ! "$VENV_PY" -c "import fastapi, uvicorn, dotenv" 2>/dev/null; then
-  echo "[setup] 安装 fastapi + uvicorn + python-dotenv 到 ../local-llm/.venv"
-  "$VENV_PY" -m pip install -q "fastapi>=0.115" "uvicorn[standard]>=0.30" "python-dotenv>=1.0"
+if ! "$VENV_PY" -c "import fastapi, uvicorn, dotenv, multipart, fitz" 2>/dev/null; then
+  echo "[setup] 安装 fastapi + uvicorn + python-dotenv + python-multipart + pymupdf 到 ../local-llm/.venv"
+  "$VENV_PY" -m pip install -q "fastapi>=0.115" "uvicorn[standard]>=0.30" "python-dotenv>=1.0" "python-multipart>=0.0.9" "pymupdf>=1.24"
 fi
 
 HOST="${BOT_HOST:-127.0.0.1}"

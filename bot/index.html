@@ -227,6 +227,36 @@
     margin-top: 6px; cursor: pointer; border: 1px solid var(--border);
   }
   .msg-image:first-child, .bubble > .msg-image:first-of-type { margin-top: 0; }
+
+  /* PDF 缩略图 (附件预览 + 历史消息) */
+  .pdf-thumb {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; min-width: 0; max-width: 280px;
+    position: relative;
+  }
+  .pdf-thumb .icon {
+    font-size: 18px; flex-shrink: 0;
+  }
+  .pdf-thumb .info { min-width: 0; flex: 1; }
+  .pdf-thumb .name {
+    font-size: 12px; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; color: var(--text);
+  }
+  .pdf-thumb .stats { font-size: 10px; color: var(--muted); margin-top: 1px; }
+  .pdf-thumb .del {
+    background: rgba(0,0,0,0.5); color: #fff; border: none; border-radius: 50%;
+    width: 16px; height: 16px; cursor: pointer; font-size: 11px; line-height: 14px;
+    padding: 0; flex-shrink: 0;
+  }
+  .pdf-thumb .del:hover { background: var(--danger); }
+  /* 历史消息里(不带 del)的 PDF chip */
+  .bubble > .pdf-thumb { margin-bottom: 6px; }
+  .bubble > .pdf-thumb:last-child { margin-bottom: 0; }
+
+  /* 上传中的等待态 */
+  .pdf-thumb.loading { opacity: 0.7; }
+  .pdf-thumb.loading .icon::after { content: " ⏳"; }
   button.primary {
     background: var(--accent); color: #06121f; border: none; padding: 8px 14px;
     border-radius: 8px; font-weight: 600; cursor: pointer;
@@ -303,12 +333,12 @@
   <div class="composer" id="composer">
     <div class="attachments-preview" id="attachments-preview"></div>
     <div class="composer-inner">
-      <input type="file" id="file-input" accept="image/*" multiple hidden />
-      <button class="attach-btn" id="attach-btn" title="附加图片 (也可粘贴或拖拽)">📎</button>
-      <textarea id="input" placeholder="输入消息,Enter 发送,Shift+Enter 换行。粘贴或拖拽可附加图片。"></textarea>
+      <input type="file" id="file-input" accept="image/*,application/pdf,.pdf" multiple hidden />
+      <button class="attach-btn" id="attach-btn" title="附加图片或 PDF (也可粘贴或拖拽)">📎</button>
+      <textarea id="input" placeholder="输入消息,Enter 发送,Shift+Enter 换行。可附加图片 / PDF。"></textarea>
       <button class="primary" id="send-btn">发送</button>
     </div>
-    <div class="hint">提示:历史保存在浏览器本地。支持粘贴截图/拖拽图片附加到消息(单张 ≤ 5MB)。</div>
+    <div class="hint">提示:历史保存在浏览器本地。支持粘贴截图/拖拽图片附加(图片 ≤ 5MB,PDF ≤ 20MB / 20 页)。</div>
   </div>
 </main>
 
@@ -332,9 +362,14 @@ let activeId = null;
 let settings = { maxTokens: 1024, temperature: 0.7, webSearch: true };
 let serverCaps = { search: false, model: false };
 let streaming = false;
-let pendingAttachments = [];  // [{url:"data:image/...;base64,...", mime, name}]
+// pendingAttachments 形态:
+//   图片: { kind:"image", url:"data:image/...;base64,...", mime, name }
+//   PDF : { kind:"pdf", name, stats, blocks:[content blocks] }
+//   上传中的 PDF: { kind:"pdf-loading", name }
+let pendingAttachments = [];
 
-const MAX_ATTACH_BYTES = 5 * 1024 * 1024;  // 单张图最大 5MB
+const MAX_IMG_BYTES = 5 * 1024 * 1024;       // 单张图 5MB
+const MAX_PDF_BYTES = 20 * 1024 * 1024;      // 单个 PDF 20MB
 
 // ============== DOM ==============
 const $ = (id) => document.getElementById(id);
@@ -455,11 +490,11 @@ function renderMessages() {
     return;
   }
   conv.messages.forEach(m => {
-    appendMessageDOM(m.role, m.content, m.stats, m.citations, m.searches);
+    appendMessageDOM(m.role, m.content, m.stats, m.citations, m.searches, m.pdf_stubs);
   });
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
-function appendMessageDOM(role, content, stats, citations, searches) {
+function appendMessageDOM(role, content, stats, citations, searches, pdfStubs) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
   const avatar = document.createElement("div");
@@ -476,7 +511,7 @@ function appendMessageDOM(role, content, stats, citations, searches) {
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  renderBubbleContent(bubble, content);
+  renderBubbleContent(bubble, content, pdfStubs);
 
   const citEl = document.createElement("div");
   if (Array.isArray(citations) && citations.length) {
@@ -496,12 +531,29 @@ function appendMessageDOM(role, content, stats, citations, searches) {
   return { bubble, meta, citEl, statusHost };
 }
 
-function renderBubbleContent(bubble, content) {
+function renderBubbleContent(bubble, content, pdfStubs) {
   bubble.innerHTML = "";
   if (typeof content === "string") {
     bubble.textContent = content;
     return;
   }
+  // 含 PDF 时:显示 PDF chip + 用户原话,不展开 PDF 全文 / 扫描页
+  if (Array.isArray(pdfStubs) && pdfStubs.length) {
+    pdfStubs.forEach(s => bubble.appendChild(makePdfChip(s, false)));
+    if (Array.isArray(content)) {
+      for (const b of content) {
+        // PDF 拆出来的 text block 都以 "=== 第 N 页" 开头,这里跳过
+        if (b && b.type === "text" && !b.text.startsWith("=== 第 ")) {
+          const t = document.createElement("div");
+          t.textContent = b.text || "";
+          t.style.whiteSpace = "pre-wrap";
+          bubble.appendChild(t);
+        }
+      }
+    }
+    return;
+  }
+  // 普通情形(可能含独立图片)
   if (Array.isArray(content)) {
     for (const b of content) {
       if (b && b.type === "text") {
@@ -584,17 +636,57 @@ function readFileAsDataURL(file) {
 }
 
 async function addAttachmentFile(file) {
+  const name = file.name || "file";
+  const isPDF = file.type === "application/pdf" || /\.pdf$/i.test(name);
+  if (isPDF) return addPDFAttachment(file);
   if (!file.type.startsWith("image/")) return;
-  if (file.size > MAX_ATTACH_BYTES) {
+  if (file.size > MAX_IMG_BYTES) {
     alert(`图片过大(${(file.size/1024/1024).toFixed(1)}MB),上限 5MB`);
     return;
   }
   try {
     const url = await readFileAsDataURL(file);
-    pendingAttachments.push({ url, mime: file.type, name: file.name || "image" });
+    pendingAttachments.push({ kind: "image", url, mime: file.type, name });
     renderAttachments();
   } catch (e) {
     console.error("read file failed", e);
+  }
+}
+
+async function addPDFAttachment(file) {
+  if (file.size > MAX_PDF_BYTES) {
+    alert(`PDF 过大(${(file.size/1024/1024).toFixed(1)}MB),上限 20MB`);
+    return;
+  }
+  // 立即插入 loading 占位,让用户看到反馈
+  const placeholder = { kind: "pdf-loading", name: file.name || "PDF" };
+  pendingAttachments.push(placeholder);
+  renderAttachments();
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch("/api/upload-pdf", { method: "POST", body: fd });
+    const j = await r.json();
+    // 替换 placeholder
+    const idx = pendingAttachments.indexOf(placeholder);
+    if (idx === -1) return;  // 用户已经移除
+    if (!r.ok) {
+      pendingAttachments.splice(idx, 1);
+      alert("PDF 解析失败:" + (j.error || r.status));
+    } else {
+      pendingAttachments[idx] = {
+        kind: "pdf",
+        name: j.filename || file.name || "PDF",
+        stats: j.stats,
+        blocks: j.content_blocks || [],
+      };
+    }
+    renderAttachments();
+  } catch (e) {
+    const idx = pendingAttachments.indexOf(placeholder);
+    if (idx !== -1) pendingAttachments.splice(idx, 1);
+    renderAttachments();
+    alert("PDF 上传失败:" + e.message);
   }
 }
 
@@ -606,17 +698,57 @@ function removeAttachment(idx) {
 function renderAttachments() {
   attachPreviewEl.innerHTML = "";
   pendingAttachments.forEach((a, i) => {
-    const wrap = document.createElement("div");
-    wrap.className = "thumb";
-    const img = document.createElement("img");
-    img.src = a.url; img.alt = a.name;
+    if (a.kind === "image") {
+      const wrap = document.createElement("div");
+      wrap.className = "thumb";
+      const img = document.createElement("img");
+      img.src = a.url; img.alt = a.name;
+      const del = document.createElement("button");
+      del.className = "del"; del.textContent = "×"; del.title = "移除";
+      del.onclick = () => removeAttachment(i);
+      wrap.appendChild(img);
+      wrap.appendChild(del);
+      attachPreviewEl.appendChild(wrap);
+    } else {
+      // pdf 或 pdf-loading
+      const stub = makePdfChip(a, true /* with delete */);
+      stub.querySelector(".del").onclick = () => removeAttachment(i);
+      attachPreviewEl.appendChild(stub);
+    }
+  });
+}
+
+function makePdfChip(a, withDelete) {
+  const el = document.createElement("div");
+  el.className = "pdf-thumb" + (a.kind === "pdf-loading" ? " loading" : "");
+  const icon = document.createElement("div");
+  icon.className = "icon"; icon.textContent = "📄";
+  const info = document.createElement("div");
+  info.className = "info";
+  const name = document.createElement("div");
+  name.className = "name"; name.textContent = a.name; name.title = a.name;
+  info.appendChild(name);
+  if (a.stats) {
+    const stats = document.createElement("div");
+    stats.className = "stats";
+    const txt = `${a.stats.processed}/${a.stats.total_pages} 页`
+      + (a.stats.image_pages ? `(${a.stats.text_pages} 文字 + ${a.stats.image_pages} 扫描)` : "")
+      + (a.stats.truncated ? " · 已截断" : "");
+    stats.textContent = txt;
+    info.appendChild(stats);
+  } else if (a.kind === "pdf-loading") {
+    const stats = document.createElement("div");
+    stats.className = "stats"; stats.textContent = "解析中...";
+    info.appendChild(stats);
+  }
+  el.appendChild(icon);
+  el.appendChild(info);
+  if (withDelete) {
     const del = document.createElement("button");
     del.className = "del"; del.textContent = "×"; del.title = "移除";
-    del.onclick = () => removeAttachment(i);
-    wrap.appendChild(img);
-    wrap.appendChild(del);
-    attachPreviewEl.appendChild(wrap);
-  });
+    el.appendChild(del);
+  }
+  return el;
 }
 
 attachBtn.addEventListener("click", () => fileInputEl.click());
@@ -709,19 +841,31 @@ function applySearchCap() {
 async function send() {
   if (streaming) return;
   const text = inputEl.value.trim();
+  // 等待 PDF 解析完成
+  if (pendingAttachments.some(a => a.kind === "pdf-loading")) {
+    alert("PDF 还在解析中,请稍候");
+    return;
+  }
   if (!text && pendingAttachments.length === 0) return;
   let conv = getActive();
   if (!conv) { createConv(); conv = getActive(); }
   inputEl.value = "";
   inputEl.style.height = "";
 
-  // 组装 user content:有图就是 OpenAI content blocks 数组,否则字符串
+  // 组装 user content + pdf_stubs(用于 UI 显示,不展开 PDF 全文)
   let userContent;
+  let pdfStubs = [];
   if (pendingAttachments.length > 0) {
     userContent = [];
     if (text) userContent.push({ type: "text", text });
     for (const a of pendingAttachments) {
-      userContent.push({ type: "image_url", image_url: { url: a.url } });
+      if (a.kind === "image") {
+        userContent.push({ type: "image_url", image_url: { url: a.url } });
+      } else if (a.kind === "pdf") {
+        // PDF 的所有 blocks 完整发给模型;UI 上只显示 stub
+        userContent.push(...a.blocks);
+        pdfStubs.push({ name: a.name, stats: a.stats });
+      }
     }
   } else {
     userContent = text;
@@ -731,9 +875,12 @@ async function send() {
   renderAttachments();
 
   // 用户消息入历史
-  conv.messages.push({ role: "user", content: userContent });
+  const userMsg = { role: "user", content: userContent };
+  if (pdfStubs.length) userMsg.pdf_stubs = pdfStubs;
+  conv.messages.push(userMsg);
   if (conv.messages.filter(m => m.role === "user").length === 1) {
-    conv.title = autoTitle(text || "[图片]");
+    const titleSrc = text || (pdfStubs.length ? pdfStubs[0].name : "[图片]");
+    conv.title = autoTitle(titleSrc);
   }
   conv.updatedAt = Date.now();
   try {
@@ -749,7 +896,7 @@ async function send() {
   // 用户消息渲染 + 助手占位
   // (renderMessages 重渲染会清空 streaming 状态,所以这里手动 append)
   if (messagesEl.querySelector(".empty")) messagesEl.innerHTML = "";
-  appendMessageDOM("user", userContent);
+  appendMessageDOM("user", userContent, null, null, null, pdfStubs);
   const { bubble, meta, citEl, statusHost } = appendMessageDOM("assistant", "");
   bubble.classList.add("cursor");
   messagesEl.scrollTop = messagesEl.scrollHeight;
