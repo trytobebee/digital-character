@@ -156,20 +156,42 @@ curl -sf http://127.0.0.1:8080/v1/models
 ## 4. API 速查
 
 ### GET `/v1/models`
-返回已加载模型列表。客户端启动时拉这个拿到 `model_id`,不要在代码里硬编码路径。
+返回已加载模型列表。
 
 ```json
 {
   "object": "list",
   "data": [
     {
-      "id": "/Users/.../Qwen3___6-35B-A3B-4bit",
+      "id": "mlx-community/Qwen3.6-35B-A3B-4bit",
       "object": "model",
       "created": 1779786638
     }
   ]
 }
 ```
+
+⚠️ **mlx-vlm 特定的坑(重要,会炸服务)**:
+**不要直接把 `/v1/models` 返回的 id 拿来当作 chat 请求的 `model` 字段!**
+
+mlx-vlm 用字符串严格比对当前已加载模型;收到不一样的 model 字符串就会:
+1. 把当前模型从内存卸载
+2. 试着按你给的 id 去 `~/.cache/huggingface/hub/` 找权重
+3. 找不到就报 `No safetensors found ...` → 500
+4. 服务还在监听但**模型已不可用**,后续所有请求都失败,直到收到匹配的字符串
+
+正确做法:**在客户端把启动时用的 `--model` 参数原样**作为 `model` 字段。
+本仓库的写法是把模型路径写死在配置里:
+
+```python
+# bot/server.py
+MODEL = "/Users/.../local-llm/models/mlx-community/Qwen3___6-35B-A3B-4bit"
+# 启动 server.sh 用的就是这个绝对路径(经符号链接解到同一目录)
+```
+
+启动 server 时打印一下确切的 id,客户端直接抄过去用,不要走 `/v1/models`。
+如果切到 llama.cpp / vLLM 后端这个问题会消失(它们都允许 model 字段为任意字符串
+或自动匹配)。
 
 ### POST `/v1/chat/completions`
 主接口,所有功能(文本/流式/工具/多模态)都走这里。
@@ -407,7 +429,7 @@ while (true) {
 | 200 但 token 出来很慢 | 内存被 swap 出去了;`footprint -pid <PID>` 看 swapped_out |
 | 工具该调没调 | 长 history + forced tool_choice 失灵。让用户新开对话 |
 | 流式只收到一个大 chunk | 这是**正常**的"伪流式"行为,不是 bug |
-| `400 invalid model` | 用了 hf id 而非本地路径。先打 `/v1/models` 拿 id |
+| `500 No safetensors found in ~/.cache/...` | **mlx-vlm 特定**:你发的 model 字段跟启动时的 `--model` 字符串不一致,触发了"换模型"流程,试图去 HF 缓存找权重失败。详见 §4 警告。模型已卸载,重启 server 即可 |
 
 ---
 
@@ -432,7 +454,8 @@ while (true) {
 
 ## 14. 复用建议清单
 
-- [ ] 客户端启动先打 `/v1/models` 拿 model_id,不要硬编码
+- [ ] mlx-vlm 后端:**不要**用 `/v1/models` 的 id;把启动时的 `--model` 字符串
+      作为单一真相源(写死或读 env)。其他后端(llama.cpp / vLLM)无此限制
 - [ ] 健康检查频率 ≥ 15s,挂掉时 UI 明确提示用户
 - [ ] 流式响应做"伪流式"重放,弥补 mlx-vlm 不真流式的视觉缺失
 - [ ] 工具调用做 normalize + 硬上限,防止模型乱填参数 / 死循环
