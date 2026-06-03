@@ -19,7 +19,8 @@ import time
 from openai import OpenAI
 
 # mlx_lm.server 的 model id 是 --model 传入的本地路径
-MODEL = "/Users/taifeng/code/digital_character/local-llm/models/mlx-community/Qwen3___6-35B-A3B-4bit"
+# ⚠️ 必须和 start_server.sh 里 --model 参数完全一致(否则 mlx-vlm 触发模型卸载+重载)
+MODEL = "/Users/taifeng/code/digital_character/local-llm/models/mlx-community/Qwen3.6-35B-A3B-4bit"
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
 
