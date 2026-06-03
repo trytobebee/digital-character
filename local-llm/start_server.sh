@@ -21,9 +21,15 @@ if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
   sleep 2
 fi
 
+# 写出 model id 到固定位置,供其他项目自动发现
+# (避免它们硬编码或走 /v1/models 拿到的短 id 触发 reload)
+DISCOVERY_FILE="/tmp/qwen-local-model-id"
+echo "$MODEL_PATH" > "$DISCOVERY_FILE"
+
 echo "[*] 启动 mlx_vlm.server (多模态) ..."
-echo "    模型:   $MODEL_PATH"
-echo "    监听:   http://127.0.0.1:8080"
+echo "    模型:    $MODEL_PATH"
+echo "    监听:    http://127.0.0.1:8080"
+echo "    发现:    $DISCOVERY_FILE  (其他项目读这个文件拿 model id)"
 echo "    thinking 模式默认关闭 (适合 RAG/Agent)"
 echo "    按 Ctrl-C 停止"
 echo ""
