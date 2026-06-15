@@ -30,10 +30,14 @@ class ToolResult:
 
 @dataclass
 class ToolContext:
-    """一次 /api/chat 请求内,所有工具共享的运行期上下文。"""
+    """一次请求/一轮 CLI 任务内,所有工具共享的运行期上下文。"""
     user_text: str                       # 最后一条用户消息的纯文本(决策/硬路由/freshness 用)
     state: dict[str, Any] = field(default_factory=dict)   # 跨工具便笺(实体、上一步结果……)
     citations: list[dict[str, Any]] = field(default_factory=list)  # 全局引用累加器
+    workdir: str = "."                   # 工具的工作根目录(CLI coding agent 用)
+    # 危险操作(写文件/执行命令)的确认回调,返回 True 才放行。
+    # 签名: async (action: str, preview: str | None) -> bool。None 表示无人值守自动放行。
+    confirm: Any = None
 
 
 # handler 签名:(已解析的参数 dict, 上下文) -> ToolResult

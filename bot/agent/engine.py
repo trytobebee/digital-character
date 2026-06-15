@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator
 
 from fastapi.requests import Request
 
+from .context import ContextManager
 from .tools import Tool, ToolContext, ToolResult
 
 
@@ -35,10 +36,18 @@ def _evt(type_: str, **kw: Any) -> dict[str, Any]:
 
 
 class Agent:
-    def __init__(self, client: Any, model: str, config: AgentConfig | None = None) -> None:
+    def __init__(
+        self,
+        client: Any,
+        model: str,
+        config: AgentConfig | None = None,
+        context_manager: ContextManager | None = None,
+    ) -> None:
         self.client = client
         self.model = model
         self.cfg = config or AgentConfig()
+        # 默认带一个上下文管理器(软目标足够高,短对话不会触发,长任务自动折叠旧工具结果)
+        self.ctx_mgr = context_manager or ContextManager()
 
     async def run_stream(
         self,
@@ -46,7 +55,7 @@ class Agent:
         tools: list[Tool],
         ctx: ToolContext,
         *,
-        request: Request,
+        request: Request | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
@@ -63,6 +72,12 @@ class Agent:
         chunk_count = 0
 
         while True:
+            # 调模型前整理上下文:越过软预算时折叠较早的大块工具结果(确定性,不靠摘要)
+            stat = self.ctx_mgr.manage(messages)
+            if stat["folded"]:
+                yield _evt("context", folded=stat["folded"],
+                           saved=stat["saved"], total=stat["after"])
+
             allow_tools = (
                 bool(tools)
                 and loops < self.cfg.max_steps
@@ -87,7 +102,7 @@ class Agent:
             try:
                 stream = await self.client.chat.completions.create(**kwargs)
                 async for chunk in stream:
-                    if await request.is_disconnected():
+                    if request is not None and await request.is_disconnected():
                         return
                     if not chunk.choices:
                         continue

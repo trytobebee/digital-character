@@ -64,8 +64,17 @@ cd bot/
 ```
 .
 ├── bot/                          FastAPI + 单页 HTML 的聊天界面
-│   ├── server.py                 SSE 流式接口,工具循环 + Bocha 集成
+│   ├── agent/                    可插拔 Agent 引擎(工具循环 + 上下文管理,bot/CLI 共用)
+│   │   ├── engine.py             模型驱动的工具循环,上游可替换
+│   │   ├── tools.py              Tool / ToolRegistry / ToolContext 抽象
+│   │   ├── context.py            上下文管理(工具结果折叠 + token 预算)
+│   │   └── builtins.py           get_current_time / calculate / web_search
+│   ├── code_agent/               终端编码 agent(类 Claude Code,复用 agent 引擎)
+│   │   ├── tools.py              read/write/edit/grep/glob/list/bash 七件套
+│   │   └── cli.py                REPL + 权限确认层(改文件/跑命令前确认)
+│   ├── server.py                 SSE 流式接口(HTTP 层,工具循环交给 agent 引擎)
 │   ├── index.html                聊天 UI,对话列表 + localStorage 持久化
+│   ├── codeagent.sh              启动终端编码 agent
 │   ├── start.sh                  启动脚本(复用 local-llm 的 venv)
 │   └── .env.example              环境变量模板
 └── local-llm/                    本地 Qwen 推理
@@ -105,10 +114,12 @@ cd bot/
 - [x] ~~关键词硬路由:`查/搜/股价/天气` 命中即强制 `tool_choice=web_search`,绕过模型 RLHF 反射~~ ✅
 - [x] ~~搜索结果诚实交代(0 结果 / 全是非今日数据时不编造)~~ ✅
 - [x] ~~freshness 支持精确日期 + 后端兜底改写到今日 YYYY-MM-DD~~ ✅
+- [x] ~~Agent 引擎:工具循环抽成可插拔三层(tools/engine/builtins),上游可替换~~ ✅
+- [x] ~~终端编码 agent(`code_agent`,类 Claude Code):7 个编码工具 + 权限确认层~~ ✅
+- [x] ~~上下文管理 Tier 1:工具结果折叠 + token 预算(确定性,不依赖弱模型摘要)~~ ✅
+- [ ] 上下文管理 Tier 2:越硬阈值时模型辅助摘要(保留 system + 摘要 + 最近 K 轮原文)
 - [ ] 前端"假流式"重放,弥补 mlx-vlm 伪流式的视觉缺失
-- [ ] 历史污染应对:长对话拒答模式滚雪球时的提示/降级策略(关键词路由能缓解但不彻底)
 - [ ] 工具扩展:天气 / 票务 / 航班(智慧旅游场景特化)
-- [ ] 上下文窗口管理(滑窗 + 历史摘要)
 - [ ] 部署:把 bot + 模型打包成 SaaS 多租户后端
 
 ## License
