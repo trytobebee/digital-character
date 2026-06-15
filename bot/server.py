@@ -1,14 +1,18 @@
 """
-本地 Qwen3.6 聊天 Bot 的 FastAPI 后端。
+本地 Qwen3.6 聊天 Bot 的 FastAPI 后端(HTTP 层)。
+
+工具循环已抽到 agent/ 包:
+  agent.engine   模型驱动的工具循环(上游可替换)
+  agent.tools    Tool / ToolRegistry 抽象
+  agent.builtins get_current_time / calculate / web_search 三个内置工具
+
+本文件只负责:HTTP 路由 + system prompt 组装 + PDF 解析 + 把引擎事件转 SSE。
 
 - GET  /            : 返回 index.html
-- POST /api/chat    : SSE 流式聊天,事件类型:
-    - token       {text}
-    - status      {stage, query, freshness}   联网搜索进度
-    - citations   {items:[{index,title,url,site,date}]}
-    - done        {stats}
-    - error       {message}
+- POST /api/chat    : SSE 流式聊天(token/status/tool_start/tool_end/citations/done/error)
+- POST /api/upload-pdf
 - GET  /api/health  : 健康/能力探测
+- GET  /api/model   : 对接发现,返回当前 model 字段
 
 启动:
     BOCHA_API_KEY=xxx ./start.sh
@@ -18,7 +22,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -32,16 +35,16 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
+from agent import Agent, AgentConfig, ToolContext, ToolRegistry, builtins
+
 HERE = Path(__file__).parent
-load_dotenv(HERE / ".env")  # 从同目录 .env 文件读取环境变量(若存在)
+load_dotenv(HERE / ".env")  # 从同目录 .env 读取环境变量(若存在)
 
 # ---------- 配置 ----------
 UPSTREAM_BASE_URL = "http://127.0.0.1:8080/v1"
 
-# MODEL 优先从 start_server.sh 写出的发现文件读取(单一真相源,自动对齐)
-# 不存在时回退到硬编码值(老的部署兼容)
-# ⚠️ 字符串必须和 mlx_vlm.server 启动时的 --model 参数完全一致,
-# 否则触发模型卸载+重载(约 5s 抖动)
+# MODEL 优先从 start_server.sh 写出的发现文件读取(单一真相源,自动对齐),
+# 否则回退硬编码。⚠️ 必须和 mlx_vlm.server 的 --model 完全一致,否则触发卸载+重载。
 _MODEL_DISCOVERY_FILE = Path("/tmp/qwen-local-model-id")
 _MODEL_FALLBACK = "/Users/taifeng/code/digital_character/local-llm/models/mlx-community/Qwen3.6-35B-A3B-4bit"
 try:
@@ -52,158 +55,29 @@ except FileNotFoundError:
     print(f"[boot] discovery file 不存在,使用 fallback MODEL: {MODEL}", flush=True)
 
 BOCHA_API_KEY = os.getenv("BOCHA_API_KEY", "").strip()
-BOCHA_URL = "https://api.bochaai.com/v1/web-search"
-
-MAX_TOOL_LOOPS = 2          # 最多与模型来回 2 轮 tool 协商
-MAX_TOTAL_TOOL_CALLS = 3    # 单次请求总共最多执行的 web_search 次数(无论并行还是串行)
-SEARCH_COUNT = 8            # 每次 web_search 返回结果数(给模型更多上下文,减少它重搜的动机)
-SEARCH_TIMEOUT_S = 15.0
 
 PDF_MAX_BYTES = 20 * 1024 * 1024  # 单个 PDF 最大 20MB
 PDF_MAX_PAGES = 20                # 一份 PDF 最多处理 20 页
 PDF_SPARSE_TEXT_CHARS = 30        # 一页文字少于此阈值视为扫描页,改用图像
-PDF_RENDER_DPI = 120              # 扫描页渲染 DPI(质量 vs 体积平衡)
+PDF_RENDER_DPI = 120              # 扫描页渲染 DPI
 
-# 当用户消息含以下"严格今天"词时,后端把 freshness 兜底改写成今日 YYYY-MM-DD,
-# 收紧博查的过去 24 小时滚动窗口(避免拿到昨天的内容)
-TODAY_STRICT_KEYWORDS = ("今天", "此刻", "现在", "刚刚", "刚才", "今晨", "今早", "今晚", "今夜")
-
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_FRESHNESS_ENUMS = {"noLimit", "oneDay", "oneWeek", "oneMonth", "oneYear"}
-
-
-def normalize_freshness(fr: str | None) -> str:
-    """模型现在可以填精确日期了,做一层后端 validate,非法值兜底为 noLimit"""
-    if not fr:
-        return "noLimit"
-    if fr in _FRESHNESS_ENUMS:
-        return fr
-    if _DATE_RE.match(fr):
-        return fr
-    return "noLimit"
-
-
-def maybe_override_to_today(fr: str, user_text: str) -> str:
-    """方案 B:用户说'今天/此刻/现在/刚刚'时,把 oneDay/noLimit 收紧到精确今日 YYYY-MM-DD"""
-    if fr in ("oneDay", "noLimit") and any(kw in user_text for kw in TODAY_STRICT_KEYWORDS):
-        return time.strftime("%Y-%m-%d")
-    return fr
-
-
-# 命中以下关键词时,第 1 轮强制 tool_choice=web_search,绕过模型 RLHF 反射 + 历史污染
-# (后续轮次仍然 auto,让模型自己决定要不要二次搜索 / 直接答)
-FORCE_SEARCH_KEYWORDS = (
-    # 显式搜索指令
-    "搜索", "搜一下", "搜下", "查一下", "查询", "查最新", "帮我查", "联网",
-    # 实时数据
-    "股价", "股票", "市值", "汇率", "天气", "温度", "价格", "行情", "比分",
-    # 时间限定词
-    "今天", "今早", "今晚", "今夜", "此刻", "现在的", "目前", "刚刚", "刚才",
-    "最近", "最新", "本周", "本月", "本年", "近期", "近况", "当下",
-    # 训练截止后的年份
-    "2025", "2026", "2027",
-    # 新闻类信号
-    "新闻", "宣布", "新发布", "刚上线", "刚上市",
-)
-
+# ---------- 引擎 + 工具注册 ----------
 aclient = AsyncOpenAI(base_url=UPSTREAM_BASE_URL, api_key="not-needed")
+agent_engine = Agent(aclient, MODEL, AgentConfig(max_steps=3, max_tool_calls=4))
+
+# 注册内置工具。加新工具只需在此 register 一行,引擎与 server 主流程都不用改。
+registry = ToolRegistry()
+registry.register(builtins.make_time_tool())
+registry.register(builtins.make_calculate_tool())
+registry.register(builtins.make_web_search_tool(lambda: BOCHA_API_KEY))
+
 app = FastAPI()
-
-
-# ---------- 当前时刻工具(无 API 依赖,纯本机时间)----------
-WEEKDAY_ZH = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-
-
-def current_time_payload() -> dict[str, Any]:
-    """统一组装本机当前时间信息(供注入 + tool 返回复用)"""
-    lt = time.localtime()
-    wd = WEEKDAY_ZH[lt.tm_wday]
-    return {
-        "iso": time.strftime("%Y-%m-%dT%H:%M:%S", lt),
-        "date": time.strftime("%Y-%m-%d", lt),
-        "time": time.strftime("%H:%M:%S", lt),
-        "weekday": wd,
-        "timezone": time.strftime("%Z", lt) or "本机时区",
-        "friendly": time.strftime("%Y年%m月%d日 ", lt) + wd + time.strftime(" %H:%M:%S", lt),
-    }
-
-
-GET_TIME_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_current_time",
-        "description": (
-            "获取服务器当前时刻(本机时区,通常即中国标准时间 UTC+8)。"
-            "返回 ISO 时间戳、日期、时间、星期、时区等字段。\n"
-            "用户问'现在几点了''当前时间''今天什么日期''今天星期几'"
-            "等关于此刻系统时间的问题时调用,确保答案是最新的实时时间,"
-            "而不是凭训练记忆猜测。"
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
-
-
-# ---------- Tool schema (web_search) ----------
-WEB_SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "web_search",
-        "description": (
-            "通过博查搜索引擎从主流公开网站(新闻、财经、百科、论文、官方站点等)"
-            "检索当前可获取的公开信息。这是检索公开数据,不是给出投资/医疗/法律建议,"
-            "你只是把搜索结果转述给用户。\n\n"
-            "必须调用的情况(不允许以'我无法访问实时数据''我不能提供投资建议'等理由拒答):\n"
-            "- 用户明确要求'搜索/联网/查一下/查询/帮我查'\n"
-            "- 涉及实时或近实时数据:股价、市值、汇率、商品价格、天气、赛事比分、航班/列车状态\n"
-            "- 涉及训练截止之后的事件:2025 年之后的新闻、发布、人事、政策、论文、产品\n"
-            "- 涉及'今天/最新/最近/本周/本月/刚刚/此刻/现在的'等时间限定的事实性问题\n"
-            "- 用户提及你不熟悉的具体公司/产品/人物/论文,需要核实事实\n\n"
-            "不应调用的情况:\n"
-            "- 纯写作任务(写诗、起草邮件、翻译、扩写)\n"
-            "- 代码/算法/数学解释\n"
-            "- 静态常识(历史事件、基础概念、定义)\n"
-            "- 用户的主观偏好/意见请求\n\n"
-            "调用纪律:\n"
-            "1) 一次提问最多调用 1-2 次本工具。\n"
-            "2) 不要并行发起多个相似查询,也不要按类别(政治/经济/科技/...)逐一检索。\n"
-            "3) 使用一个综合、足够具体的查询词;一次结果不充分时,再换关键词重搜一次,到此为止。\n"
-            "4) 拿到结果后直接基于结果作答,不要为了'更全面'反复检索。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "简洁的搜索关键词,使用更接近搜索引擎的形式,不要带'请帮我'之类的口语",
-                },
-                "freshness": {
-                    "type": "string",
-                    "description": (
-                        "时间范围过滤。可选值有两类:\n"
-                        "(a) 枚举: noLimit / oneDay / oneWeek / oneMonth / oneYear\n"
-                        "(b) 精确日期: YYYY-MM-DD 格式 (如 2026-05-27)\n"
-                        "选用建议:\n"
-                        "- '今天/此刻/现在/刚刚' → 用今日的 YYYY-MM-DD (绝不要用 oneDay,后者是过去 24 小时滚动窗口,会含昨天内容)\n"
-                        "- '本周/最近几天' → oneWeek\n"
-                        "- '本月/最近一个月' → oneMonth\n"
-                        "- '今年' → oneYear\n"
-                        "- 不确定就用 noLimit"
-                    ),
-                },
-            },
-            "required": ["query"],
-        },
-    },
-}
 
 
 # ---------- 数据模型 ----------
 class Message(BaseModel):
     role: str
-    # content 可以是字符串 (纯文本) 或 OpenAI content blocks 数组 (多模态):
-    #   [{"type":"text","text":"..."},
-    #    {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]
+    # content 可为字符串(纯文本)或 OpenAI content blocks 数组(多模态)
     content: str | list[dict[str, Any]]
 
 
@@ -216,72 +90,20 @@ class ChatRequest(BaseModel):
 
 
 def msg_text(content: str | list[dict[str, Any]]) -> str:
-    """从可能是多模态的 content 里抽出纯文本(用于日志/搜索决策的可读化)"""
+    """从可能多模态的 content 里抽出纯文本(用于日志/决策可读化)。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         return " ".join(
-            b.get("text", "")
-            for b in content
+            b.get("text", "") for b in content
             if isinstance(b, dict) and b.get("type") == "text"
         )
     return ""
 
 
-# ---------- Bocha 搜索 ----------
-async def bocha_search(query: str, freshness: str = "noLimit") -> dict[str, Any]:
-    if not BOCHA_API_KEY:
-        raise RuntimeError("BOCHA_API_KEY 未设置")
-    async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT_S) as c:
-        r = await c.post(
-            BOCHA_URL,
-            headers={
-                "Authorization": f"Bearer {BOCHA_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"query": query, "freshness": freshness, "summary": True, "count": SEARCH_COUNT},
-        )
-        if r.status_code >= 400:
-            # 把博查返回的响应体带上,方便定位 invalid key / quota 等问题
-            body = r.text[:400]
-            raise RuntimeError(f"HTTP {r.status_code} from Bocha: {body}")
-        return r.json()
-
-
-def format_search_results(payload: dict[str, Any], offset: int) -> tuple[str, list[dict]]:
-    """把 Bocha 响应转成 (给模型读的纯文本, 引用列表)。"""
-    data = payload.get("data") or {}
-    pages = ((data.get("webPages") or {}).get("value")) or []
-    citations: list[dict] = []
-    parts: list[str] = []
-    for i, p in enumerate(pages, 1):
-        idx = offset + i
-        title = (p.get("name") or "").strip()
-        url = (p.get("url") or "").strip()
-        site = (p.get("siteName") or "").strip()
-        date = (p.get("datePublished") or "")[:10]
-        summary = (p.get("summary") or p.get("snippet") or "").strip()[:800]
-        citations.append({
-            "index": idx, "title": title, "url": url, "site": site, "date": date,
-        })
-        parts.append(
-            f"[{idx}] {title}\n来源: {site}{(' · ' + date) if date else ''}\n{summary}\nURL: {url}"
-        )
-    text = "\n\n".join(parts) if parts else "(无搜索结果)"
-    return text, citations
-
-
 # ---------- PDF 解析 ----------
 def parse_pdf_to_blocks(data: bytes) -> dict[str, Any]:
-    """
-    用 PyMuPDF 把 PDF 解析为 OpenAI content blocks。
-    每页有正文 (>= PDF_SPARSE_TEXT_CHARS 字符) 走 text block;
-    稀疏/扫描页走 image_url block(渲染为 PNG)。
-
-    返回:
-      content_blocks: list[dict] — 可直接拼到 user message 的 content
-      stats: 文件元信息(总页数 / 文本页数 / 图像页数 / 是否截断)
-    """
+    """用 PyMuPDF 把 PDF 解析为 OpenAI content blocks:文字页走 text,扫描页渲染 PNG 走 image_url。"""
     doc = fitz.open(stream=data, filetype="pdf")
     total_pages = doc.page_count
     process_count = min(total_pages, PDF_MAX_PAGES)
@@ -294,37 +116,50 @@ def parse_pdf_to_blocks(data: bytes) -> dict[str, Any]:
         page = doc[i]
         text = (page.get_text() or "").strip()
         if len(text) >= PDF_SPARSE_TEXT_CHARS:
-            blocks.append({
-                "type": "text",
-                "text": f"=== 第 {i + 1} 页 / 共 {total_pages} 页 ===\n{text}",
-            })
+            blocks.append({"type": "text", "text": f"=== 第 {i + 1} 页 / 共 {total_pages} 页 ===\n{text}"})
             text_pages += 1
         else:
-            # 渲染为 PNG 走 VL 路径
             pix = page.get_pixmap(dpi=PDF_RENDER_DPI)
-            png_bytes = pix.tobytes("png")
-            b64 = base64.b64encode(png_bytes).decode()
-            blocks.append({
-                "type": "text",
-                "text": f"=== 第 {i + 1} 页 / 共 {total_pages} 页 (扫描页,见下图) ===",
-            })
-            blocks.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
-            })
+            b64 = base64.b64encode(pix.tobytes("png")).decode()
+            blocks.append({"type": "text", "text": f"=== 第 {i + 1} 页 / 共 {total_pages} 页 (扫描页,见下图) ==="})
+            blocks.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
             image_pages += 1
 
     doc.close()
     return {
         "content_blocks": blocks,
         "stats": {
-            "total_pages": total_pages,
-            "processed": process_count,
-            "text_pages": text_pages,
-            "image_pages": image_pages,
+            "total_pages": total_pages, "processed": process_count,
+            "text_pages": text_pages, "image_pages": image_pages,
             "truncated": total_pages > PDF_MAX_PAGES,
         },
     }
+
+
+# ---------- system prompt 组装 ----------
+def build_system_text(req_system: str | None, use_search: bool) -> str:
+    """拼接 system prompt:用户角色 + 当前时刻注入 + (开搜时)诚实交代规则。"""
+    parts: list[str] = []
+    if req_system and req_system.strip():
+        parts.append(req_system.strip())
+
+    now = builtins.current_time_payload()
+    parts.append(
+        f"当前时刻: {now['friendly']} ({now['timezone']})。"
+        "涉及'现在几点/今天日期/星期几/此刻'类系统时间问题时,直接基于此值回答,不需要联网搜索。"
+    )
+    if use_search:
+        parts.append(
+            f"当前日期: {now['date']}。涉及实时信息、最新事件、近期数据、或你不确定的具体事实时,优先调用 web_search。"
+            "常识/代码/写作类不要调用。一个问题最多调用 3 次,不要并行发相似查询或按类别逐一检索,拿到结果直接综合作答。\n"
+            "【对搜索结果的诚实交代】\n"
+            "1) 返回 0 条:直说'未在博查索引中找到 <主题> 的相关内容',请用户换问法或稍后再试,不要凭记忆编造。\n"
+            "2) 结果全早于今天:明说'我能拿到的最新相关数据停留在 <实际日期>',据此回答,"
+            "不要编造'今日休市/节假日/数据未发布'等借口(你不知道现实市场状态)。\n"
+            "3) 滞后数据(股价/汇率/天气/赛况):告知'此为最新可检索数据,实时分钟级请到行情软件/官方 APP'。\n"
+            "4) 绝不捏造具体数字、价格、温度、比分、人事任命;宁可说'未拿到此数据'。"
+        )
+    return "\n\n".join(parts).strip()
 
 
 # ---------- 路由 ----------
@@ -335,7 +170,6 @@ def index() -> FileResponse:
 
 @app.post("/api/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
-    """接收 PDF 文件,返回 content_blocks(text + image_url 混合)+ stats。"""
     if not (file.filename or "").lower().endswith(".pdf") and file.content_type != "application/pdf":
         return JSONResponse({"error": "仅支持 .pdf 文件"}, status_code=400)
     data = await file.read()
@@ -351,7 +185,8 @@ async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"error": f"PDF 解析失败: {e}"}, status_code=400)
     result["filename"] = file.filename
-    print(f"[pdf] {file.filename!r}  pages={result['stats']['processed']}/{result['stats']['total_pages']}  text={result['stats']['text_pages']}  image={result['stats']['image_pages']}", flush=True)
+    print(f"[pdf] {file.filename!r}  pages={result['stats']['processed']}/{result['stats']['total_pages']}  "
+          f"text={result['stats']['text_pages']}  image={result['stats']['image_pages']}", flush=True)
     return JSONResponse(result)
 
 
@@ -369,12 +204,11 @@ async def health() -> JSONResponse:
 
 @app.get("/api/model")
 def get_model() -> JSONResponse:
-    """对接发现:返回当前 bot 配置使用的 model 字段(其他项目对接时直接用这个值,
-    与 mlx_vlm.server 已加载字符串完全一致,不会触发 reload)"""
     return JSONResponse({
         "model": MODEL,
         "discovery_file": str(_MODEL_DISCOVERY_FILE),
         "upstream": UPSTREAM_BASE_URL,
+        "tools": [t.name for t in registry.available_tools()],
     })
 
 
@@ -384,231 +218,40 @@ def sse(event: dict[str, Any]) -> str:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
+    use_search = bool(req.web_search and BOCHA_API_KEY)
+
+    # 组装 messages:system(角色 + 时刻 + 诚实规则)+ 历史
     msgs: list[dict[str, Any]] = []
-    sys_parts: list[str] = []
-    if req.system and req.system.strip():
-        sys_parts.append(req.system.strip())
-    # 永远注入当前时刻 — 这样模型问'几点了/今天星期几'时不用走任何 tool 就能答
-    now = current_time_payload()
-    sys_parts.append(
-        f"当前时刻: {now['friendly']} ({now['timezone']})。"
-        f"无论用户用什么角色与你对话,涉及'现在几点/今天日期/星期几/此刻'类系统时间问题时,"
-        f"直接基于此值回答,不需要联网搜索。"
-    )
-    if req.web_search and BOCHA_API_KEY:
-        today = now["date"]
-        extra = (
-            f"当前日期: {today}。当问题涉及实时信息、最新事件、近期数据、"
-            "或你不确定的具体事实时,优先调用 web_search 工具。常识/代码/写作类问题不要调用。"
-            f"对一个用户问题最多调用 {MAX_TOTAL_TOOL_CALLS} 次 web_search,"
-            "不要并行发起多个相似查询,也不要按类别(政治/经济/科技/...)逐一检索。"
-            "拿到结果后直接综合回答,不要为了'更全面'反复重搜。\n"
-            "【重要:对搜索结果的诚实交代】\n"
-            "1) 搜索返回 0 条结果:直接告诉用户'未在博查索引中找到 <主题> 的相关内容',"
-            "可能原因是该话题暂未被收录或关键词需要调整,请用户换种问法或稍后再试。"
-            "不要凭训练记忆编造答案。\n"
-            "2) 搜索结果全部早于今天:明确说出'我能拿到的最新相关数据停留在 <实际日期>',"
-            "并据此回答,不要编造'市场未开盘''今日休市''节假日''数据尚未发布'等借口"
-            f"(模型不知道现实的市场状态,不要瞎猜)。\n"
-            "3) 搜索结果是滞后数据:对实时性敏感的查询(股价/汇率/天气/赛况),"
-            "明确告知用户'此为最新可检索的数据,实时分钟级行情请到行情软件/官方 APP 查看'。\n"
-            "4) 绝对不要捏造具体数字、价格、温度、比分、人事任命等事实。"
-            "宁可说'未拿到此数据',也不要给假数据。"
-        )
-        sys_parts.append(extra)
-    sys_text = "\n\n".join(sys_parts).strip()
+    sys_text = build_system_text(req.system, use_search)
     if sys_text:
         msgs.append({"role": "system", "content": sys_text})
     msgs.extend(m.model_dump() for m in req.messages)
 
-    # 工具装配:get_current_time 永远可用;web_search 仅在开启 + 有 key 时可用
-    use_search = bool(req.web_search and BOCHA_API_KEY)
-    tools_for_request: list[dict[str, Any]] = [GET_TIME_TOOL]
-    if use_search:
-        tools_for_request.append(WEB_SEARCH_TOOL)
-    use_tools = bool(tools_for_request)
-    # 诊断日志:显示请求关键字段,排查 UI 联网开关是否真的发了上来
+    # 工具集:从注册表取可用工具,但 web_search 仅在前端开关打开时才挂(即便有 key)
+    tools = [
+        t for t in registry.available_tools()
+        if t.name != "web_search" or use_search
+    ]
+
     last_user_msg = next((m for m in reversed(req.messages) if m.role == "user"), None)
     last_user_text = msg_text(last_user_msg.content) if last_user_msg else ""
-    has_image = isinstance(last_user_msg.content, list) and any(
-        isinstance(b, dict) and b.get("type") == "image_url"
-        for b in last_user_msg.content
-    ) if last_user_msg else False
-    # 关键词硬路由:命中即强制第 1 轮调 web_search,绕过模型 RLHF 反射 + 历史污染
-    # 只在 web_search 工具实际可用时才考虑硬路由
-    matched_kws = [kw for kw in FORCE_SEARCH_KEYWORDS if kw in last_user_text]
-    force_search = use_search and bool(matched_kws)
+    has_image = bool(
+        last_user_msg and isinstance(last_user_msg.content, list)
+        and any(isinstance(b, dict) and b.get("type") == "image_url" for b in last_user_msg.content)
+    )
     print(
-        f"[chat] web_search={req.web_search}  use_tools={use_tools}  "
-        f"force_search={force_search}  matched_kws={matched_kws[:5]}  "
-        f"has_image={has_image}  msg={last_user_text[:60]!r}",
-        flush=True,
+        f"[chat] web_search={req.web_search} tools={[t.name for t in tools]} "
+        f"has_image={has_image} msg={last_user_text[:60]!r}", flush=True,
     )
 
+    ctx = ToolContext(user_text=last_user_text)
+
     async def gen():
-        all_citations: list[dict] = []
-        loops = 0
-        total_tool_calls = 0
-        t0 = time.perf_counter()
-        first_t: float | None = None
-        chunk_count = 0
-
-        while True:
-            # 同时受 loop 次数和总调用次数限制
-            allow_tools = (
-                use_tools
-                and loops < MAX_TOOL_LOOPS
-                and total_tool_calls < MAX_TOTAL_TOOL_CALLS
-            )
-            print(f"[chat]   loop={loops} ENTRY allow_tools={allow_tools} total_calls={total_tool_calls}", flush=True)
-            kwargs: dict[str, Any] = dict(
-                model=MODEL,
-                messages=msgs,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                stream=True,
-            )
-            if allow_tools:
-                kwargs["tools"] = tools_for_request
-                if loops == 0 and force_search:
-                    # 第 1 轮强制调 web_search;后续轮次回到 auto 让模型自己决定
-                    kwargs["tool_choice"] = {
-                        "type": "function",
-                        "function": {"name": "web_search"},
-                    }
-                else:
-                    kwargs["tool_choice"] = "auto"
-
-            content_acc = ""
-            tool_calls_acc: dict[int, dict[str, str]] = {}
-            try:
-                stream = await aclient.chat.completions.create(**kwargs)
-                async for chunk in stream:
-                    if await request.is_disconnected():
-                        return
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-                    if delta and getattr(delta, "content", None):
-                        if first_t is None:
-                            first_t = time.perf_counter()
-                        chunk_count += 1
-                        content_acc += delta.content
-                        yield sse({"type": "token", "text": delta.content})
-                    tcs = getattr(delta, "tool_calls", None) if delta else None
-                    if tcs:
-                        for tc in tcs:
-                            idx = getattr(tc, "index", 0) or 0
-                            slot = tool_calls_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                            if getattr(tc, "id", None):
-                                slot["id"] = tc.id
-                            fn = getattr(tc, "function", None)
-                            if fn:
-                                if getattr(fn, "name", None):
-                                    slot["name"] = fn.name
-                                if getattr(fn, "arguments", None):
-                                    slot["arguments"] += fn.arguments
-            except Exception as e:
-                yield sse({"type": "error", "message": f"模型调用失败: {e}"})
-                return
-
-            if not tool_calls_acc:
-                print(f"[chat]   loop={loops} no tool_calls, content_len={len(content_acc)}", flush=True)
-                break  # 模型直接回答完毕
-            print(f"[chat]   loop={loops} got {len(tool_calls_acc)} tool_calls", flush=True)
-
-            # 模型要调工具:构造 assistant 消息 + 执行 + tool 消息
-            # 单轮内若并行发了过多 tool_calls,只执行剩余配额数那么多;但每个 tool_call 仍需对应 tool 消息回写
-            sorted_idxs = sorted(tool_calls_acc.keys())
-            remaining_quota = max(0, MAX_TOTAL_TOOL_CALLS - total_tool_calls)
-            tool_calls_list = []
-            execute_flags: list[bool] = []
-            for k, idx in enumerate(sorted_idxs):
-                s = tool_calls_acc[idx]
-                tool_calls_list.append({
-                    "id": s["id"] or f"call_{idx}",
-                    "type": "function",
-                    "function": {"name": s["name"], "arguments": s["arguments"] or "{}"},
-                })
-                execute_flags.append(k < remaining_quota)
-            msgs.append({
-                "role": "assistant",
-                "content": content_acc or None,
-                "tool_calls": tool_calls_list,
-            })
-
-            for tc, should_execute in zip(tool_calls_list, execute_flags):
-                name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"]["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-
-                if not should_execute:
-                    msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": f"已达到本次会话的搜索调用上限 ({MAX_TOTAL_TOOL_CALLS} 次),请基于已有搜索结果直接回答用户。",
-                    })
-                    continue
-
-                if name == "get_current_time":
-                    payload = current_time_payload()
-                    total_tool_calls += 1
-                    msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": json.dumps(payload, ensure_ascii=False),
-                    })
-                elif name == "web_search":
-                    q = args.get("query", "") or ""
-                    fr_raw = args.get("freshness", "noLimit") or "noLimit"
-                    fr = normalize_freshness(fr_raw)
-                    fr_after = maybe_override_to_today(fr, last_user_text)
-                    if fr_after != fr:
-                        print(f"[chat]   freshness override: {fr_raw!r} -> {fr_after!r}", flush=True)
-                    fr = fr_after
-                    yield sse({"type": "status", "stage": "searching", "query": q, "freshness": fr})
-                    try:
-                        payload = await bocha_search(q, fr)
-                        text, cits = format_search_results(payload, offset=len(all_citations))
-                        all_citations.extend(cits)
-                        tool_result = text
-                    except Exception as e:
-                        tool_result = f"搜索失败: {e}"
-                        yield sse({"type": "error", "message": f"web_search 失败: {e}"})
-                    total_tool_calls += 1
-                    msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": tool_result,
-                    })
-                else:
-                    msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": f"未知工具: {name}",
-                    })
-
-            loops += 1
-            # 下一轮:把搜索结果带回模型,要么继续搜(loops < MAX),要么直接答(超 MAX 时禁用 tools)
-
-        # 收尾
-        if all_citations:
-            yield sse({"type": "citations", "items": all_citations})
-
-        t1 = time.perf_counter()
-        if first_t is not None:
-            gen_s = max(t1 - first_t, 1e-6)
-            stats = {
-                "tokens": chunk_count,
-                "ttft_ms": round((first_t - t0) * 1000),
-                "gen_s": round(gen_s, 2),
-                "tps": round(chunk_count / gen_s, 1),
-            }
-        else:
-            stats = {"tokens": 0, "ttft_ms": None, "gen_s": 0, "tps": 0}
-        yield sse({"type": "done", "stats": stats})
+        async for ev in agent_engine.run_stream(
+            msgs, tools, ctx,
+            request=request, max_tokens=req.max_tokens, temperature=req.temperature,
+        ):
+            yield sse(ev)
 
     return StreamingResponse(
         gen(),
