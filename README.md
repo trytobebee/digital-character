@@ -71,6 +71,7 @@ cd bot/
 │   │   └── builtins.py           get_current_time / calculate / web_search
 │   ├── code_agent/               终端编码 agent(类 Claude Code,复用 agent 引擎)
 │   │   ├── tools.py              read/write/edit/grep/glob/list/bash 七件套
+│   │   ├── verify.py             自我验证器(语法检查 + 可选测试命令)
 │   │   └── cli.py                REPL + 权限确认层(改文件/跑命令前确认)
 │   ├── server.py                 SSE 流式接口(HTTP 层,工具循环交给 agent 引擎)
 │   ├── index.html                聊天 UI,对话列表 + localStorage 持久化
@@ -117,6 +118,7 @@ cd bot/
 - [x] ~~Agent 引擎:工具循环抽成可插拔三层(tools/engine/builtins),上游可替换~~ ✅
 - [x] ~~终端编码 agent(`code_agent`,类 Claude Code):7 个编码工具 + 权限确认层~~ ✅
 - [x] ~~上下文管理 Tier 1:工具结果折叠 + token 预算(确定性,不依赖弱模型摘要)~~ ✅
+- [x] ~~自我验证闭环:改完自动跑语法检查/测试命令,失败把报错喂回去逼模型修(引擎级强制,封顶 2 轮)~~ ✅
 - [ ] 上下文管理 Tier 2:越硬阈值时模型辅助摘要(保留 system + 摘要 + 最近 K 轮原文)
 - [ ] 前端"假流式"重放,弥补 mlx-vlm 伪流式的视觉缺失
 - [ ] 工具扩展:天气 / 票务 / 航班(智慧旅游场景特化)

@@ -235,6 +235,7 @@ def make_write_file() -> Tool:
             p.write_text(content, encoding="utf-8")
         except Exception as e:
             return ToolResult(content=f"写入失败: {e}")
+        ctx.state.setdefault("edited_files", set()).add(str(p))
         return ToolResult(content=f"已写入 {p} ({len(content)} 字符)")
 
     return Tool(
@@ -280,6 +281,7 @@ def make_edit_file() -> Tool:
             p.write_text(new_text, encoding="utf-8")
         except Exception as e:
             return ToolResult(content=f"写入失败: {e}")
+        ctx.state.setdefault("edited_files", set()).add(str(p))
         return ToolResult(content=f"已编辑 {p}(替换 {count if replace_all else 1} 处)")
 
     return Tool(

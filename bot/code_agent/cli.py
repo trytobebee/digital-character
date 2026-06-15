@@ -24,6 +24,7 @@ from openai import AsyncOpenAI
 
 from agent import Agent, AgentConfig, ToolContext
 from .tools import all_coding_tools
+from .verify import make_verifier
 
 # ---------- 终端着色 ----------
 C = {
@@ -51,6 +52,8 @@ SYSTEM_PROMPT = """你是一个在终端里工作的编码助手(类似 Claude C
 4. 一次只做一件明确的事,做完简要说明你改了什么。
 5. 不确定用户意图时,先问清楚再动手,不要擅自大改。
 6. 涉及破坏性命令(rm/git push/覆盖文件)务必谨慎,让用户清楚知道后果。
+7. 你改完文件后,系统会自动验证(语法/测试)。若收到"【自动验证未通过】"消息,
+   说明你的改动有问题,请根据报错定位并修复,不要狡辩或忽略。
 保持简洁,像一个专注的工程师那样工作。"""
 
 
@@ -87,17 +90,23 @@ def _resolve_model() -> str:
     return "/Users/taifeng/code/digital_character/local-llm/models/mlx-community/Qwen3.6-35B-A3B-4bit"
 
 
-async def run(workdir: str, base_url: str) -> None:
+async def run(workdir: str, base_url: str, verify_cmd: str | None) -> None:
     model = _resolve_model()
     client = AsyncOpenAI(base_url=base_url, api_key="not-needed")
     # 编码任务步数更多,放宽到 8 步 / 12 次工具调用
-    agent = Agent(client, model, AgentConfig(max_steps=8, max_tool_calls=12, temperature=0.3))
+    verifier = make_verifier(workdir, verify_cmd)
+    agent = Agent(
+        client, model,
+        AgentConfig(max_steps=8, max_tool_calls=12, temperature=0.3, max_verify_rounds=2),
+        verifier=verifier,
+    )
     tools = all_coding_tools()
     perm = Permission()
 
     print(c("┌─ 本地 Code Agent ", "cyan") + c(f"(模型 {Path(model).name})", "dim"))
     print(c("│  workdir: ", "cyan") + workdir)
     print(c("│  工具: ", "cyan") + ", ".join(t.name for t in tools))
+    print(c("│  验证: ", "cyan") + ("语法检查 + " + verify_cmd if verify_cmd else "语法检查 (ast.parse)"))
     print(c("│  /reset 清历史  /ctx 看占用  /help 帮助  /exit 退出", "dim"))
     print(c("└─", "cyan"))
 
@@ -153,6 +162,15 @@ async def run(workdir: str, base_url: str) -> None:
                 elif t == "context":
                     print(c(f"\n  🗜 折叠了 {ev.get('folded')} 条旧工具结果,省 ~{ev.get('saved')} tok"
                             f"(当前约 {ev.get('total')} tok)", "dim"))
+                elif t == "verify":
+                    if ev.get("ok"):
+                        print(c(f"\n  ✓ 自动验证通过 ({ev.get('ran')})", "green"))
+                    else:
+                        print(c(f"\n  ✗ 自动验证未通过 ({ev.get('ran')}),让模型修复…", "yellow"))
+                        rpt = (ev.get("report") or "").strip()
+                        if rpt:
+                            for line in rpt.splitlines()[:6]:
+                                print(c("    " + line, "dim"))
                 elif t == "error":
                     print(c(f"\n[错误] {ev.get('message')}", "red"))
                 elif t == "done":
@@ -180,10 +198,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="本地 LLM 的终端编码 agent")
     ap.add_argument("--workdir", default=None, help="工作根目录(默认当前目录)")
     ap.add_argument("--base-url", default="http://127.0.0.1:8080/v1", help="本地模型 OpenAI 兼容端点")
+    ap.add_argument("--verify", default=None, help="改完后跑的验证命令(如 'pytest -q');默认仅做 .py 语法检查")
     args = ap.parse_args()
     workdir = str(Path(args.workdir).expanduser().resolve()) if args.workdir else str(Path.cwd())
     try:
-        asyncio.run(run(workdir, args.base_url))
+        asyncio.run(run(workdir, args.base_url, args.verify))
     except KeyboardInterrupt:
         pass
 

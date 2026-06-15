@@ -29,6 +29,7 @@ class AgentConfig:
     max_tool_calls: int = 4     # 单请求总工具执行次数硬上限(无论并行/串行)
     max_tokens: int = 1024
     temperature: float = 0.7
+    max_verify_rounds: int = 2  # 自我验证失败后,最多再逼模型修复几轮
 
 
 def _evt(type_: str, **kw: Any) -> dict[str, Any]:
@@ -42,12 +43,16 @@ class Agent:
         model: str,
         config: AgentConfig | None = None,
         context_manager: ContextManager | None = None,
+        verifier: Any = None,
     ) -> None:
         self.client = client
         self.model = model
         self.cfg = config or AgentConfig()
         # 默认带一个上下文管理器(软目标足够高,短对话不会触发,长任务自动折叠旧工具结果)
         self.ctx_mgr = context_manager or ContextManager()
+        # 自我验证回调: async (ToolContext) -> {"ok": bool, "ran": str, "report": str}
+        # None 表示不验证(bot 聊天场景无需);CLI 编码场景注入一个。
+        self.verifier = verifier
 
     async def run_stream(
         self,
@@ -67,6 +72,7 @@ class Agent:
 
         loops = 0
         total_tool_calls = 0
+        verify_rounds = 0
         t0 = time.perf_counter()
         first_t: float | None = None
         chunk_count = 0
@@ -131,7 +137,32 @@ class Agent:
                 return
 
             if not tool_calls_acc:
-                break  # 模型直接答完
+                # 模型自认为答完。若本轮改过文件,触发自我验证闭环:
+                # 跑验证 → 失败则把报错喂回去逼它修 → 直到通过或到上限。
+                if (
+                    self.verifier is not None
+                    and ctx.state.get("edited_files")
+                    and verify_rounds < self.cfg.max_verify_rounds
+                ):
+                    verify_rounds += 1
+                    vr = await self.verifier(ctx)
+                    yield _evt("verify", ok=vr.get("ok", False),
+                               ran=vr.get("ran", ""), report=(vr.get("report") or "")[:600])
+                    if not vr.get("ok", False):
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "【自动验证未通过】对你刚才改动的文件运行了验证,结果如下,"
+                                "请定位并修复(改完无需多解释,直接动手):\n"
+                                f"$ {vr.get('ran','')}\n{vr.get('report','')}"
+                            ),
+                        })
+                        # 注意:不清空 edited_files。即便模型口头说"改了"却没真动手,
+                        # 下一轮仍会再验,直到通过或到 max_verify_rounds 上限。
+                        continue
+                    # 验证通过:清空待验证集合,正常收尾
+                    ctx.state["edited_files"] = set()
+                break  # 模型直接答完(无改动 / 验证通过 / 已达验证上限)
 
             # 模型要调工具:装 assistant 消息 + 按配额执行 + 回写 tool 消息
             sorted_idxs = sorted(tool_calls_acc.keys())
